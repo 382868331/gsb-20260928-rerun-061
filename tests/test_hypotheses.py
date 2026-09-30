@@ -1,0 +1,248 @@
+"""Second-turn scenarios: disputed causality, corrections, frozen findings."""
+import pytest
+
+from investigation import Casebook, Hypothesis, InvestigationStore, RecordRef
+
+
+def proc(record_id, pid, *, guid=None, parent=None, ts=0.0, **extra):
+    record = {"record_id": record_id, "kind": "process", "ts": ts,
+              "pid": pid, "aliases": ([f"guid:{guid}"] if guid else []),
+              "refs": ([{"relation": "parent", "target": f"guid:{parent}"}]
+                       if parent else [])}
+    record.update(extra)
+    return record
+
+
+def test_conflicting_parentage_keeps_both_claims_with_trust_and_scope():
+    store = InvestigationStore()
+    # Child arrives first; both feeds later disagree about its parent.
+    store.import_source("edr-a", [
+        proc("c", pid=4444, guid="child", parent="p-a", ts=100.0),
+    ], trust=0.9, scopes=["host-a"])
+    assert len(store.pending_refs()) == 1
+
+    # Late parent events: same recycled PID 1234, different GUIDs.  Equal
+    # timestamps/PIDs must not merge or infer identity.
+    store.import_source("edr-a", [
+        proc("c", pid=4444, guid="child", parent="p-a", ts=100.0),
+        proc("pa", pid=1234, guid="p-a", ts=90.0),
+    ], trust=0.9, scopes=["host-a"])
+    store.import_source("edr-b", [
+        proc("c2", pid=4444, guid="child", parent="p-b", ts=100.0),
+        proc("pb", pid=1234, guid="p-b", ts=99.9999),
+    ], trust=0.6, scopes=["host-b"])
+
+    groups = store.conflict_groups()
+    assert len(groups) == 1
+    group = groups[0]
+    assert group.relation == "parent"
+    assert {h.cause_id for h in group.hypotheses} == {
+        store.get_event("guid:p-a").event_id,
+        store.get_event("guid:p-b").event_id,
+    }
+    by_cause = {h.cause_id: h for h in group.hypotheses}
+    ha = by_cause[store.get_event("guid:p-a").event_id]
+    hb = by_cause[store.get_event("guid:p-b").event_id]
+    assert ha.confidence == 0.9 and "host-a" in ha.scopes
+    assert hb.confidence == 0.6 and "host-b" in hb.scopes
+    assert {(c.source_id, c.record_id) for c in ha.claims} == {("edr-a", "c")}
+    # Raw evidence graph still carries both; nothing was auto-merged.
+    assert len(store.edges()) == 2
+
+
+def test_hypothesis_set_pins_one_branch_for_tracking():
+    store = InvestigationStore()
+    store.import_source("edr-a", [
+        proc("c", pid=1, guid="child", parent="p-a"),
+        proc("pa", pid=2, guid="p-a"),
+    ])
+    store.import_source("edr-b", [
+        proc("c2", pid=1, guid="child", parent="p-b"),
+        proc("pb", pid=2, guid="p-b"),
+    ])
+    group = store.conflict_groups()[0]
+    pick_a = next(h.hypothesis_id for h in group.hypotheses
+                  if h.cause_id == store.get_event("guid:p-a").event_id)
+    store.create_hypothesis_set("work", [pick_a], activate=True)
+
+    result = store.trace("guid:child", save=True)
+    assert [h.cause_id for h in result.upstream] == [
+        store.get_event("guid:p-a").event_id]
+    # The rejected alternative keeps its evidence for later review.
+    rejected = store.hypothesis_evidence(
+        Hypothesis.make_id(store.get_event("guid:child").event_id, "parent",
+                           store.get_event("guid:p-b").event_id))
+    assert rejected.active_claims
+
+
+def test_source_correction_retracts_claim_but_keeps_history():
+    store = InvestigationStore()
+    store.import_source("edr-a", [
+        proc("c", pid=1, guid="child", parent="p-a"),
+        proc("pa", pid=2, guid="p-a"),
+    ])
+    store.import_source("edr-b", [
+        proc("c2", pid=1, guid="child", parent="p-b"),
+        proc("pb", pid=2, guid="p-b"),
+    ])
+    # A human-recorded correction from feed A withdraws its old claim.
+    store.import_source("edr-a-correction", [{
+        "record_id": "fix-1", "kind": "process", "ts": 200.0,
+        "pid": 1, "aliases": ["guid:child"],
+        "retracts": [{"source_id": "edr-a", "record_id": "c"}],
+        "refs": [],
+    }], trust=1.0, scopes=["correction"])
+
+    groups = store.conflict_groups(include_retracted=True)
+    a_hyp = next(h for g in groups for h in g.hypotheses
+                 if h.cause_id == store.get_event("guid:p-a").event_id)
+    assert a_hyp.is_retracted
+    assert RecordRef("edr-a", "c") in a_hyp.retracted_claims
+    # Retraction metadata still cites who withdrew what.
+    assert store.retractions()[RecordRef("edr-a-correction", "fix-1")] == (
+        RecordRef("edr-a", "c"),)
+    # The live conflict now has one live explanation; the old one remains.
+    live = store.conflict_groups()
+    assert live == []
+    all_hyps = store.hypotheses(include_retracted=True)
+    assert len(all_hyps) == 2
+
+
+def test_only_affected_saved_paths_are_recomputed_on_revoke():
+    store = InvestigationStore()
+    store.import_source("feed", [
+        proc("root", pid=10, guid="root"),
+        proc("kid", pid=11, guid="kid", parent="root"),
+        proc("other", pid=12, guid="other"),
+    ])
+    touched = store.trace("guid:kid", save=True)
+    untouched = store.trace("guid:other", save=True)
+    assert all(p.valid for p in store.saved_paths())
+
+    # Analyst links an unrelated event into the chain, then revokes it.
+    link_id = store.add_manual_link("guid:other", "guid:kid", "injected",
+                                   note="suspected loader")
+    assert len(store.stale_paths()) == 2
+    refreshed = store.trace("guid:kid", save=True)
+    assert any(h.relation == "injected" for h in refreshed.upstream)
+
+    # Recomputing the untouched path marks it valid again.
+    store.trace("guid:other", save=True)
+    assert store.stale_paths() == []
+
+    assert store.retract_manual_link(link_id) is True
+    states = {(p.seed, p.valid) for p in store.saved_paths()}
+    # The other<->kid edge touched the 'kid' path (and 'other' as endpoint).
+    assert (touched.origin_id, False) in states
+
+
+def test_revoke_unrelated_source_keeps_path_valid():
+    store = InvestigationStore()
+    store.import_source("chain", [
+        proc("p", pid=1, guid="p"),
+        proc("c", pid=2, guid="c", parent="p"),
+    ])
+    store.import_source("side", [proc("s", pid=3, guid="s")])
+    store.trace("guid:c", save=True)
+    store.trace("guid:s", save=True)
+    store.revoke_source("side")
+    by_seed = {p.seed: p for p in store.saved_paths()}
+    assert by_seed[store.get_event("guid:c").event_id].valid is True
+    assert by_seed["side:s"].valid is False
+
+
+def test_manual_link_is_independent_evidence_and_reopens(tmp_path):
+    store = InvestigationStore()
+    store.import_source("edr", [
+        proc("a", pid=1, guid="a"), proc("b", pid=2, guid="b")])
+    link_id = store.add_manual_link("guid:a", "guid:b", "parent",
+                                   note="analyst correlation",
+                                   confidence=0.75, scopes=["ir-team"])
+    result = store.trace("guid:b")
+    hop, = result.upstream
+    assert hop.claims == (RecordRef("manual", link_id),)
+    # Snapshot round trip keeps the manual association.
+    from investigation.snapshot import save_snapshot, load_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "c.json"))
+    assert reloaded.manual_links()[0].note == "analyst correlation"
+    assert reloaded.trace("guid:b").upstream[0].claims[0].source_id == "manual"
+
+
+def test_manual_link_visible_under_active_hypothesis_set():
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", pid=1, guid="child", parent="p-a"),
+        proc("pa", pid=2, guid="p-a"),
+    ])
+    store.import_source("b", [
+        proc("c2", pid=1, guid="child", parent="p-b"),
+        proc("pb", pid=2, guid="p-b"),
+    ])
+    store.import_source("x", [proc("x", pid=3, guid="x")])
+    pick = Hypothesis.make_id(store.get_event("guid:child").event_id, "parent",
+                              store.get_event("guid:p-a").event_id)
+    store.create_hypothesis_set("work", [pick], activate=True)
+    store.trace("guid:child", save=True)
+    store.add_manual_link("guid:x", "guid:child", "injected",
+                          note="analyst link")
+    assert len(store.stale_paths()) == 1
+    refreshed = store.trace("guid:child", save=True)
+    relations = {h.relation for h in refreshed.upstream}
+    assert relations == {"parent", "injected"}
+
+
+def test_saved_finding_reopens_and_compares_with_later_evidence(tmp_path):
+    store = InvestigationStore()
+    store.import_source("edr-a", [
+        proc("c", pid=1, guid="child", parent="p-a"),
+        proc("pa", pid=2, guid="p-a"),
+    ])
+    store.import_source("edr-b", [
+        proc("c2", pid=1, guid="child", parent="p-b"),
+        proc("pb", pid=2, guid="p-b"),
+    ])
+    pick = Hypothesis.make_id(store.get_event("guid:child").event_id, "parent",
+                              store.get_event("guid:p-a").event_id)
+    store.create_hypothesis_set("work", [pick], activate=True)
+    store.trace("guid:child", save=True)
+
+    book = Casebook(case_id="case-1")
+    finding_id = book.save_finding(store, title="initial judgment",
+                                   note="A feed trusted")
+    path = tmp_path / "casebook.json"
+    book.save(path)
+
+    # Later: feed A corrects itself; new evidence arrives downstream.
+    store.import_source("edr-a-correction", [{
+        "record_id": "fix", "kind": "process", "aliases": ["guid:child"],
+        "retracts": [{"source_id": "edr-a", "record_id": "c"}],
+        "refs": []}])
+    store.import_source("edr-c", [{
+        "record_id": "conn", "kind": "network", "ts": 300.0,
+        "dst": "203.0.113.9:443",
+        "refs": [{"relation": "opened", "target": "guid:child"}]}])
+
+    book = Casebook.load(path)
+    assert [f["title"] for f in book.findings] == ["initial judgment"]
+    # Reopen the past exactly as decided then.
+    past = book.reopen(finding_id)
+    past_trace = book.frozen_trace(
+        finding_id, past.get_event("guid:child").event_id)
+    assert [h.cause_id for h in past_trace.upstream] == [
+        past.get_event("guid:p-a").event_id]
+    assert past.edges() and not past.get_event("conn:edr-c:conn")
+
+    comparison = book.compare_with_latest(finding_id, store)
+    diff, = comparison.path_diffs
+    assert [h.relation for h in diff.added_downstream] == ["opened"]
+    # The hypothesis originally chosen no longer has live evidence.
+    assert pick in comparison.selected_hypotheses_missing
+
+    # Saving again appends; the old judgment is never overwritten.
+    book.save_finding(store, title="after correction")
+    book.save(path)
+    reloaded = Casebook.load(path)
+    assert [f["title"] for f in reloaded.findings] == [
+        "initial judgment", "after correction"]
+    with pytest.raises(ValueError):
+        reloaded.save_finding(store, finding_id=finding_id)

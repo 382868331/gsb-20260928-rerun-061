@@ -39,6 +39,8 @@ class Source:
     description: str = ""
     imported_at: float | None = None
     record_ids: set[str] = field(default_factory=set)
+    trust: float | None = None
+    scopes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -82,3 +84,69 @@ class PendingRef:
     target: str
     claim: RecordRef
 
+
+@dataclass(frozen=True)
+class ManualLink:
+    """An analyst-asserted causal link, revocable independently of sources."""
+
+    link_id: str
+    cause: str
+    effect: str
+    relation: str
+    note: str = ""
+    confidence: float = 0.5
+    scopes: tuple[str, ...] = ("manual",)
+    retracts: tuple[RecordRef, ...] = ()
+    created_at: float | None = None
+
+    def claim(self) -> RecordRef:
+        return RecordRef(MANUAL_SOURCE, self.link_id)
+
+
+MANUAL_SOURCE = "manual"
+
+
+@dataclass
+class Hypothesis:
+    """One candidate causal explanation for one (effect, relation) slot.
+
+    Conflicting sources produce distinct Hypothesis objects in the same
+    conflict group; every claim (including retracted ones) is retained so
+    that each explanation keeps its evidence and its trust scope.
+    """
+
+    hypothesis_id: str
+    effect_id: str
+    relation: str
+    cause_id: str
+    claims: frozenset[RecordRef]
+    retracted_claims: frozenset[RecordRef] = frozenset()
+    scopes: frozenset[str] = frozenset()
+    confidence: float = 0.5
+    origins: frozenset[str] = frozenset()
+
+    @staticmethod
+    def make_id(effect_id: str, relation: str, cause_id: str) -> str:
+        return f"h:{effect_id}#{relation}<-{cause_id}"
+
+    @property
+    def active_claims(self) -> frozenset[RecordRef]:
+        return self.claims - self.retracted_claims
+
+    @property
+    def is_retracted(self) -> bool:
+        return not self.active_claims
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "hypothesis_id": self.hypothesis_id,
+            "effect_id": self.effect_id,
+            "relation": self.relation,
+            "cause_id": self.cause_id,
+            "claims": [c.as_dict() for c in sorted(self.claims)],
+            "retracted_claims": [c.as_dict() for c in sorted(self.retracted_claims)],
+            "scopes": sorted(self.scopes),
+            "confidence": self.confidence,
+            "origins": sorted(self.origins),
+            "retracted": self.is_retracted,
+        }
