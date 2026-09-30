@@ -12,8 +12,6 @@ class EventKind(str, Enum):
 
     @classmethod
     def coerce(cls, value: str | "EventKind") -> "EventKind":
-        if isinstance(value, EventKind):
-            return value
         try:
             return cls(value)
         except ValueError as exc:
@@ -82,3 +80,48 @@ class PendingRef:
     target: str
     claim: RecordRef
 
+
+@dataclass(frozen=True)
+class Evidence:
+    """A source assertion and the credible interval assigned to it."""
+
+    claim: RecordRef
+    confidence_low: float = 0.0
+    confidence_high: float = 1.0
+    note: str | None = None
+
+    def key(self) -> tuple[str, str, float, float, str]:
+        return (
+            self.claim.source_id,
+            self.claim.record_id,
+            self.confidence_low,
+            self.confidence_high,
+            self.note or "",
+        )
+
+
+@dataclass(frozen=True)
+class CausalHypothesis:
+    """One distinct causal explanation for an effect/relation pair."""
+
+    hypothesis_id: str
+    cause_id: str
+    effect_id: str
+    relation: str
+    evidence: frozenset[Evidence]
+    manual: bool = False
+
+    @property
+    def claims(self) -> frozenset[RecordRef]:
+        return frozenset(item.claim for item in self.evidence)
+
+    def confidence_range(self) -> tuple[float, float]:
+        if not self.evidence:
+            return 0.0, 1.0
+        return (
+            min(item.confidence_low for item in self.evidence),
+            max(item.confidence_high for item in self.evidence),
+        )
+
+    def key(self) -> tuple[str, str, str]:
+        return (self.cause_id, self.effect_id, self.relation)

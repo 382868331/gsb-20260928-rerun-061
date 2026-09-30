@@ -41,10 +41,34 @@ def main() -> None:
             hop.cause_id, hop.relation, hop.effect_id,
             ", ".join(f"{c.source_id}/{c.record_id}" for c in hop.claims)))
 
-    # 4) Snapshot + restore.
+    # 4) A later correction can disagree without overwriting the first claim.
+    store.import_source("analyst-review", [
+        {"record_id": "evt-2-review", "kind": "process", "ts": 102.0,
+         "aliases": ["guid:evil-child"],
+         "refs": [{"relation": "parent",
+                   "target": "guid:review-parent",
+                   "confidence_low": 0.3,
+                   "confidence_high": 0.55}]},
+        {"record_id": "review-parent", "kind": "process", "ts": 99.0,
+         "aliases": ["guid:review-parent"]},
+    ], description="Later analyst correction")
+    conflicts = store.conflicting_hypotheses("guid:evil-child", "parent")
+    print("\ncompeting parent hypotheses:", len(conflicts))
+    for hypothesis in conflicts:
+        print("  parent=%s range=%s claims=%s" % (
+            hypothesis.cause_id,
+            hypothesis.confidence_range(),
+            ", ".join(f"{e.claim.source_id}/{e.claim.record_id}"
+                       for e in hypothesis.evidence),
+        ))
+
+    store.close_investigation("demo-case", "guid:evil-child",
+                              "initial EDR/OS causal judgment")
+
+    # 5) Snapshot + restore preserves the frozen judgment and current graph.
     path = save_snapshot(store, "/tmp/investigation_snapshot.json")
     reloaded = load_snapshot(path)
-    assert len(reloaded.edges()) == 3
+    assert len(reloaded.edges()) == 4
     print("\nsnapshot saved to", path, "- edges after reload:",
           len(reloaded.edges()))
 

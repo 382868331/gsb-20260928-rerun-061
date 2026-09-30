@@ -18,6 +18,11 @@
   批次不会产生重复事件或重复来源声明。
 - **撤销无幽灵**：撤销一个来源后，图从剩余记录整体重放重建；只被该
   来源声明的事件与边全部消失，仍被其他来源声明的关系保留。
+- **分歧是假设，不是覆盖**：不同来源给出不同父事件时，分别保存为
+  `CausalHypothesis`，各自保留证据记录和可信范围；分析人员可选择一组
+  假设继续追踪。
+- **调查结论不可变**：关闭调查会冻结当时选择、路径和判断。后续导入、
+  来源更正或撤销只标记受影响路径，可重开旧结论并与最新证据比较。
 
 ## 记录格式
 
@@ -30,7 +35,9 @@
     "refs": [
         {"relation": "parent",      # 关系名自定义：parent/wrote/opened ...
          "target": "guid:evil-parent",
-         "direction": "incoming"}  # incoming: target -> 本事件；outgoing 反向
+         "direction": "incoming",  # incoming: target -> 本事件；outgoing 反向
+         "confidence_low": 0.72,
+         "confidence_high": 0.91}
     ]
 }
 ```
@@ -55,6 +62,17 @@ for hop in result.upstream:      # 谁导致了它
 for hop in result.downstream:    # 它导致了什么
     hop.claims                   # 每条联系的来源记录
 
+for hypothesis in store.conflicting_hypotheses("guid:evil-child", "parent"):
+    hypothesis.evidence
+    hypothesis.confidence_range()
+store.select_hypotheses([hypothesis.hypothesis_id])
+
+record_id = store.add_manual_link("guid:a", "guid:b", "influenced")
+store.revoke_manual_link(record_id)
+store.close_investigation("case-1", "guid:evil-child", "当时判断")
+comparison = store.compare_investigation("case-1")
+store.reopen_investigation("case-1")
+
 store.revoke_source("edr")      # 撤销来源，整体重放，无残留
 save_snapshot(store, "case.json")
 store = load_snapshot("case.json")
@@ -62,12 +80,12 @@ store = load_snapshot("case.json")
 
 ## 文件
 
-- `investigation/models.py`：事件、来源、边、未决引用模型
-- `investigation/store.py`：导入/撤销、身份归并（并查集）、显式边解析、
-  双向因果追踪、快照序列化
+- `investigation/models.py`：事件、来源、边、证据、因果假设、未决引用模型
+- `investigation/store.py`：导入/撤销、身份归并、分歧假设、假设选择、
+  人工关联、受影响调查刷新、双向追踪、快照序列化
 - `investigation/snapshot.py`：快照读写
-- `tests/test_investigation.py`：乱序、伪相似、重复导入、撤销、跨源归并、
-  快照等场景测试
+- `tests/test_investigation.py`：乱序、伪相似、重复 PID、冲突父事件、
+  来源更正、人工撤销、调查归档对比等场景测试
 
 ## 运行测试
 

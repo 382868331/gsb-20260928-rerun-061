@@ -160,10 +160,177 @@ def test_file_and_network_chain_with_evidence_per_edge(tmp_path):
     assert len(reloaded.edges()) == 3
     assert reloaded.trace("guid:parent").downstream[0].claims
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["version"] == 1
+    assert raw["version"] == 2
 
 
 def test_unknown_trace_seed_raises():
     store = InvestigationStore()
     with pytest.raises(KeyError):
         store.trace("guid:missing")
+
+
+def test_recycled_pid_and_close_timestamps_do_not_merge_or_infer():
+    store = InvestigationStore()
+    store.import_source("edr", [
+        proc("old", pid=4444, ts=10.0, guid="old-process"),
+        proc("new", pid=4444, ts=1000.0, guid="new-process"),
+        proc("nearby", pid=5555, ts=1000.001, guid="nearby"),
+    ])
+    assert len(store.events) == 3
+    assert store.edges() == []
+    assert store.trace("guid:new-process").events.keys() == {"edr:new"}
+
+
+def test_conflicting_parents_keep_evidence_ranges_and_allow_selection():
+    store = InvestigationStore()
+    child = proc("child", pid=4444, ts=100.0, guid="child",
+                 parent_guid="guid:parent-a")
+    child["refs"][0].update({
+        "confidence_low": 0.75,
+        "confidence_high": 0.9,
+        "note": "EDR parent PID lookup",
+    })
+    corrected_child = {
+        "record_id": "child-correction",
+        "kind": "process",
+        "ts": 100.0,
+        "aliases": ["guid:child"],
+        "refs": [{
+            "relation": "parent",
+            "target": "guid:parent-b",
+            "confidence_low": 0.2,
+            "confidence_high": 0.45,
+            "note": "later audit correction",
+        }],
+    }
+    store.import_source("edr", [child])
+    store.import_source("audit", [
+        proc("a", pid=100, ts=90.0, guid="parent-a"),
+        proc("b", pid=200, ts=90.0, guid="parent-b"),
+        corrected_child,
+    ])
+
+    candidates = store.conflicting_hypotheses("guid:child", "parent")
+    assert {item.cause_id for item in candidates} == {"audit:a", "audit:b"}
+    by_cause = {item.cause_id: item for item in candidates}
+    assert by_cause["audit:a"].confidence_range() == (0.75, 0.9)
+    assert by_cause["audit:b"].confidence_range() == (0.2, 0.45)
+    assert {(item.claim.source_id, item.claim.record_id)
+            for item in by_cause["audit:a"].evidence} == {("edr", "child")}
+
+    chosen = by_cause["audit:a"].hypothesis_id
+    trace = store.trace("guid:child", hypothesis_ids=[chosen])
+    assert [hop.cause_id for hop in trace.upstream] == ["audit:a"]
+    assert trace.hypothesis_ids == (chosen,)
+
+
+def test_revoking_manual_or_source_refreshes_only_affected_saved_paths(tmp_path):
+    store = InvestigationStore()
+    store.import_source("edr", [
+        proc("p", pid=100, ts=1.0, guid="parent"),
+        proc("c", pid=200, parent_guid="guid:parent", ts=2.0, guid="child"),
+        proc("other", pid=300, ts=3.0, guid="other"),
+    ])
+    store.import_source("filefeed", [
+        {"record_id": "f", "kind": "file", "ts": 4.0,
+         "aliases": ["file:x"],
+         "refs": [{"relation": "wrote", "target": "guid:other",
+                   "direction": "incoming"}]}
+    ])
+    store.import_source("netfeed", [
+        proc("independent", pid=900, ts=5.0, guid="independent"),
+        {"record_id": "conn", "kind": "network", "ts": 6.0,
+         "aliases": ["net:independent"],
+         "refs": [{"relation": "opened", "target": "guid:independent",
+                   "direction": "incoming"}]},
+    ])
+    manual_record = store.add_manual_link(
+        "guid:child", "file:x", "wrote",
+        confidence_low=0.6, confidence_high=0.8,
+    )
+    selected = [
+        h.hypothesis_id for h in store.causal_hypotheses()
+        if h.effect_id in {"edr:c", "filefeed:f"}
+        and (
+            h.relation == "parent"
+            or (h.relation == "wrote" and h.cause_id == "edr:c")
+        )
+    ]
+    affected = store.close_investigation(
+        "case-child", "guid:child", "follow EDR parent",
+        hypothesis_ids=selected,
+    )
+    other_selected = [
+        h.hypothesis_id for h in store.causal_hypotheses()
+        if h.effect_id == "netfeed:conn" and h.relation == "opened"
+    ]
+    unaffected = store.close_investigation(
+        "case-other", "guid:independent", "independent network path",
+        hypothesis_ids=other_selected,
+    )
+
+    snapshot_path = save_snapshot(store, tmp_path / "before.json")
+    reopened = load_snapshot(snapshot_path)
+    reopened_trace = reopened.reopen_investigation("case-child")
+    assert [hop.cause_id for hop in reopened_trace.upstream] == ["edr:p"]
+    assert reopened.get_investigation("case-child").judgment == "follow EDR parent"
+
+    assert store.revoke_manual_link(manual_record) is True
+    assert store.get_investigation("case-child").status == "path_changed"
+    assert store.get_investigation("case-child").trace_keys == affected.trace_keys
+    assert store.get_investigation("case-other").status == "current"
+    assert store.get_investigation("case-other").trace_keys == unaffected.trace_keys
+
+    store.revoke_source("edr")
+    assert store.get_investigation("case-child").status == "missing"
+    assert store.get_investigation("case-other").status == "current"
+    assert store.get_investigation("case-child").hypotheses[0].evidence
+
+
+def test_saved_judgment_can_be_compared_with_latest_evidence(tmp_path):
+    store = InvestigationStore()
+    store.import_source("edr", [
+        proc("a", pid=100, ts=1.0, guid="parent-a"),
+        proc("c", pid=200, ts=2.0, guid="child",
+             parent_guid="guid:parent-a"),
+    ])
+    original_id = [
+        h.hypothesis_id for h in store.conflicting_hypotheses(
+            "guid:child", "parent"
+        )
+    ]
+    assert original_id == []
+    original_id = [
+        h.hypothesis_id for h in store.hypotheses_for_effect("guid:child", "parent")
+    ]
+    saved = store.close_investigation(
+        "case-1", "guid:child", "parent A caused child",
+        hypothesis_ids=original_id,
+    )
+    path = save_snapshot(store, tmp_path / "closed.json")
+
+    store.import_source("audit", [
+        proc("b", pid=101, ts=0.9, guid="parent-b"),
+        {"record_id": "correction", "kind": "process", "ts": 2.0,
+         "aliases": ["guid:child"],
+         "refs": [{"relation": "parent", "target": "guid:parent-b"}]},
+    ])
+    comparison = store.compare_investigation("case-1")
+    assert comparison.still_current == tuple(saved.selected_hypothesis_ids)
+    assert comparison.new_alternatives
+
+    corrected_child = proc("c", pid=200, ts=2.0, guid="child",
+                           parent_guid="guid:parent-b")
+    store.import_source("edr", [
+        proc("a", pid=100, ts=1.0, guid="parent-a"),
+        corrected_child,
+    ])
+    comparison = store.compare_investigation("case-1")
+    assert comparison.missing == tuple(saved.selected_hypothesis_ids)
+    assert comparison.new_alternatives
+    assert store.get_investigation("case-1").judgment == "parent A caused child"
+    assert store.get_investigation("case-1").hypotheses[0].cause_id == "edr:a"
+
+    reloaded = load_snapshot(path)
+    assert reloaded.get_investigation("case-1").judgment == "parent A caused child"
+    assert reloaded.reopen_investigation("case-1") is not None
