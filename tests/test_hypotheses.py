@@ -5,10 +5,11 @@ from investigation import Casebook, Hypothesis, InvestigationStore, RecordRef
 
 
 def proc(record_id, pid, *, guid=None, parent=None, ts=0.0, **extra):
+    parent_ref = (parent if isinstance(parent, dict) else
+                  {"relation": "parent", "target": f"guid:{parent}"} if parent else None)
     record = {"record_id": record_id, "kind": "process", "ts": ts,
               "pid": pid, "aliases": ([f"guid:{guid}"] if guid else []),
-              "refs": ([{"relation": "parent", "target": f"guid:{parent}"}]
-                       if parent else [])}
+              "refs": ([parent_ref] if parent_ref else [])}
     record.update(extra)
     return record
 
@@ -246,3 +247,120 @@ def test_saved_finding_reopens_and_compares_with_later_evidence(tmp_path):
         "initial judgment", "after correction"]
     with pytest.raises(ValueError):
         reloaded.save_finding(store, finding_id=finding_id)
+
+
+def test_time_ranged_manual_judgments_keep_phase_separate():
+    store = InvestigationStore()
+    store.import_source("base", [
+        proc("c", 1, guid="child"),
+        proc("a", 2, guid="parent-a"),
+        proc("b", 3, guid="parent-b"),
+    ])
+    store.add_manual_link("guid:parent-a", "guid:child", "parent",
+                          link_id="phase-a", valid_start=0, valid_end=10,
+                          note="first stage")
+    store.add_manual_link("guid:parent-b", "guid:child", "parent",
+                          link_id="phase-b", valid_start=11, valid_end=20,
+                          note="second stage")
+
+    assert store.conflict_groups() == []
+    assert [h.cause_id for h in store.trace("guid:child", at_time=5).upstream] == [
+        store.get_event("guid:parent-a").event_id]
+    assert [h.cause_id for h in store.trace("guid:child", at_time=15).upstream] == [
+        store.get_event("guid:parent-b").event_id]
+    assert len(store.trace("guid:child", at_time=25).upstream) == 0
+
+
+def test_time_range_change_only_invalidates_overlapping_saved_path():
+    store = InvestigationStore()
+    store.import_source("base", [
+        proc("c", 1, guid="child"), proc("a", 2, guid="parent-a")])
+    store.add_manual_link("guid:parent-a", "guid:child", "parent",
+                          link_id="phase", valid_start=0, valid_end=10)
+    store.trace("guid:child", save=True, at_time=5)
+    store.trace("guid:child", save=True, at_time=20)
+    assert all(p.valid for p in store.saved_paths())
+
+    store.add_manual_link("guid:parent-a", "guid:child", "parent",
+                          link_id="phase", valid_start=0, valid_end=8)
+    states = {state.at_time: state.valid for state in store.saved_paths()}
+    assert states == {5.0: False, 20.0: True}
+
+
+def test_revoked_source_keeps_original_candidates_and_exclusions(tmp_path):
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", 1, guid="child", parent="pa"),
+        proc("pa", 2, guid="pa"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    group = store.conflict_groups()[0]
+    selected, excluded = group.hypotheses
+    store.create_hypothesis_set(
+        "case", [selected.hypothesis_id],
+        excluded_hypothesis_ids=[excluded.hypothesis_id],
+        judgments={selected.hypothesis_id: "path fits memory timeline"},
+        activate=True)
+    store.trace("guid:child", save=True)
+    store.revoke_source("a")
+
+    historical = store.hypothesis_evidence(selected.hypothesis_id)
+    assert RecordRef("a", "c") in historical.claims
+    assert historical.is_retracted
+    saved_set, = store.hypothesis_sets()
+    assert selected.hypothesis_id in saved_set.hypothesis_ids
+    assert excluded.hypothesis_id in saved_set.excluded_hypothesis_ids
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "case.json"))
+    reopened_set, = reloaded.hypothesis_sets()
+    assert selected.hypothesis_id in reopened_set.hypothesis_ids
+    assert excluded.hypothesis_id in reopened_set.excluded_hypothesis_ids
+    assert reloaded.hypothesis_evidence(selected.hypothesis_id).claims
+
+
+def test_hypothesis_set_explains_path_conflicts_and_unresolved():
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", 1, guid="child", parent="pa"),
+        proc("pa", 2, guid="pa"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    group = store.conflict_groups()[0]
+    selected = next(h for h in group.hypotheses if h.cause_id.endswith(":pa"))
+    excluded = next(h for h in group.hypotheses if h.cause_id.endswith(":pb"))
+    store.create_hypothesis_set(
+        "work", [selected.hypothesis_id],
+        excluded_hypothesis_ids=[excluded.hypothesis_id], activate=True)
+
+    explanation = store.explain_hypothesis_set("work")
+    child_id = store.get_event("guid:child").event_id
+    assert child_id in explanation.explained_events
+    assert "b" in explanation.conflicting_sources
+    assert excluded in explanation.excluded
+
+
+def test_saved_hypothesis_sets_cannot_be_overwritten():
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", 1, guid="child", parent="pa"),
+        proc("pa", 2, guid="pa"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    group = store.conflict_groups()[0]
+    store.create_hypothesis_set("v1", [group.hypotheses[0].hypothesis_id])
+    with pytest.raises(Exception):
+        store.create_hypothesis_set("v1", [group.hypotheses[0].hypothesis_id])

@@ -173,8 +173,11 @@ class Casebook:
                 new_result = TraceResult(seed, [], [], {}, [])
             diffs.append(_diff_paths(old_result, new_result))
         live = {h.hypothesis_id for h in latest.hypotheses(include_retracted=True)}
-        missing = tuple(h for h in frozen.get("selected_hypotheses", ())
-                        if h not in live)
+        live_hypotheses = {h.hypothesis_id: h
+                           for h in latest.hypotheses(include_retracted=True)}
+        missing = tuple(
+            h for h in frozen.get("selected_hypotheses", ())
+            if h not in live or not live_hypotheses[h].active_claims)
         return FindingComparison(
             finding_id=finding_id, path_diffs=diffs,
             selected_hypotheses_missing=missing)

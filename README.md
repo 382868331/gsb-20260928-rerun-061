@@ -30,9 +30,16 @@
 - **人工关联是一等证据**：`add_manual_link(...)` 产生 `manual:<id>` 来源
   声明，带分析人员备注、可信值与范围，可独立撤销；也可用 retracts 参数
   同时撤回机器声明。
-- **假设集**：分析人员为每个有分歧的槽位选定一条解释组成
-  `HypothesisSet`；`trace(..., set_id=...)` 只沿选定假设追踪，被否决候选
-  的证据仍完整保留。
+- **阶段化人工判断**：人工关联和机器引用都可带 `valid_start` /
+  `valid_end`。同一对象在不同阶段可以有不同关系；时间不重叠的候选不
+  冲突，局部判断不会被推广到全部历史。
+- **假设集**：分析人员可保存多组完整判断组成独立 `HypothesisSet`；每组
+  记录选中候选、显式排除候选及判断备注。`trace(..., set_id=...)` 只沿
+  选定假设追踪，`explain_hypothesis_set(...)` 汇总路径解释了哪些事件、
+  与哪些来源冲突，以及仍未解释的部分。
+- **候选只增不改**：来源撤回、更正或时间调整后，原始候选关系、来源声明
+  和排除依据继续保留，只把候选标记为失效/撤回；每个假设组保存后都可从
+  快照独立重开。
 - **只重算受影响路径**：`trace(..., save=True)` 保存调查路径。来源重导/
   撤销或人工关联变更后，只有支撑证据（或锚点事件）发生变化的路径被
   标记失效（`stale_paths()`），无关路径保持有效。
@@ -101,9 +108,12 @@ store.trace("guid:evil-child", save=True)
 link_id = store.add_manual_link(
     "guid:loader", "guid:evil-child", "parent",
     note="分析人员核对内存镜像", confidence=0.8, scopes=["ir-team"],
-    retracts=[("edr", "evt-2")],       # 可选：撤回一条旧声明
+    valid_start=100.0, valid_end=200.0,
+    retracts=[("edr", "evt-2")],
 )
-store.retract_manual_link(link_id)      # 只影响相关路径
+store.retract_manual_link(link_id)
+store.trace("guid:evil-child", at_time=150.0, set_id="working")
+store.explain_hypothesis_set("working")
 
 book = Casebook(case_id="INC-42")
 finding_id = book.save_finding(store, title="初步判断")

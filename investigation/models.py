@@ -98,6 +98,8 @@ class ManualLink:
     scopes: tuple[str, ...] = ("manual",)
     retracts: tuple[RecordRef, ...] = ()
     created_at: float | None = None
+    valid_start: float | None = None
+    valid_end: float | None = None
 
     def claim(self) -> RecordRef:
         return RecordRef(MANUAL_SOURCE, self.link_id)
@@ -124,10 +126,19 @@ class Hypothesis:
     scopes: frozenset[str] = frozenset()
     confidence: float = 0.5
     origins: frozenset[str] = frozenset()
+    valid_start: float | None = None
+    valid_end: float | None = None
 
     @staticmethod
-    def make_id(effect_id: str, relation: str, cause_id: str) -> str:
-        return f"h:{effect_id}#{relation}<-{cause_id}"
+    def make_id(effect_id: str, relation: str, cause_id: str,
+                valid_start: float | None = None,
+                valid_end: float | None = None) -> str:
+        window = ""
+        if valid_start is not None or valid_end is not None:
+            start = "" if valid_start is None else valid_start
+            end = "" if valid_end is None else valid_end
+            window = f"@[{start},{end}]"
+        return f"h:{effect_id}#{relation}<-{cause_id}{window}"
 
     @property
     def active_claims(self) -> frozenset[RecordRef]:
@@ -136,6 +147,15 @@ class Hypothesis:
     @property
     def is_retracted(self) -> bool:
         return not self.active_claims
+
+    def active_at(self, moment: float | None) -> bool:
+        if moment is None:
+            return True
+        if self.valid_start is not None and moment < self.valid_start:
+            return False
+        if self.valid_end is not None and moment > self.valid_end:
+            return False
+        return True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -148,5 +168,7 @@ class Hypothesis:
             "scopes": sorted(self.scopes),
             "confidence": self.confidence,
             "origins": sorted(self.origins),
+            "valid_start": self.valid_start,
+            "valid_end": self.valid_end,
             "retracted": self.is_retracted,
         }

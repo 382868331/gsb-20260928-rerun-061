@@ -14,7 +14,9 @@ from .store import ImportError as InvestigationImportError
 from .store import (
     ConflictGroup,
     HypothesisSet,
+    HypothesisSetExplanation,
     InvestigationStore,
+    ManualJudgment,
     PathState,
     TraceResult,
 )
@@ -30,6 +32,8 @@ __all__ = [
     "MANUAL_SOURCE",
     "ConflictGroup",
     "HypothesisSet",
+    "HypothesisSetExplanation",
+    "ManualJudgment",
     "PathState",
     "Casebook",
     "FindingComparison",

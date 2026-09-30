@@ -48,6 +48,16 @@ class ConflictGroup:
     hypotheses: list[Hypothesis]
 
     @property
+    def valid_start(self) -> float | None:
+        values = [h.valid_start for h in self.hypotheses if h.valid_start is not None]
+        return min(values) if values else None
+
+    @property
+    def valid_end(self) -> float | None:
+        values = [h.valid_end for h in self.hypotheses if h.valid_end is not None]
+        return max(values) if values else None
+
+    @property
     def conflicting(self) -> bool:
         return len([h for h in self.hypotheses if not h.is_retracted]) > 1
 
@@ -58,6 +68,28 @@ class HypothesisSet:
     hypothesis_ids: frozenset[str]
     description: str = ""
     created_at: float | None = None
+    excluded_hypothesis_ids: frozenset[str] = frozenset()
+    judgments: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ManualJudgment:
+    link_id: str
+    action: str
+    link: ManualLink | None
+    recorded_at: float | None
+    note: str = ""
+
+
+@dataclass
+class HypothesisSetExplanation:
+    set_id: str
+    selected: tuple[Hypothesis, ...]
+    excluded: tuple[Hypothesis, ...]
+    explained_events: tuple[str, ...]
+    conflicting_sources: tuple[str, ...]
+    unexplained_events: tuple[str, ...]
+    unresolved: tuple[PendingRef, ...]
 
 
 @dataclass
@@ -65,9 +97,11 @@ class PathState:
     seed: str
     set_id: str | None
     max_depth: int | None
+    at_time: float | None
     result: TraceResult
     reached: frozenset[str]
     anchors: frozenset[str]
+    edge_anchors: frozenset[str] = frozenset()
     valid: bool = True
 
 
@@ -92,8 +126,10 @@ class InvestigationStore:
         self._pending: dict[tuple[str, str, str, str, str, str], PendingRef] = {}
         # Analyst-asserted links (never replaced by source imports).
         self._manual_links: dict[str, ManualLink] = {}
+        self._manual_judgments: list[ManualJudgment] = []
         # Hypothesis-derived state (rebuilt alongside the graph).
         self._hypotheses: dict[str, Hypothesis] = {}
+        self._hypothesis_ledger: dict[str, Hypothesis] = {}
         self._claim_meta: dict[RecordRef, tuple[float, frozenset[str]]] = {}
         self._retractions: dict[RecordRef, frozenset[RecordRef]] = {}
         # Analyst-selected working sets of hypotheses.
@@ -164,6 +200,8 @@ class InvestigationStore:
         confidence: float = 0.5,
         scopes: Iterable[str] = ("manual",),
         retracts: Iterable[RecordRef | tuple[str, str]] = (),
+        valid_start: float | None = None,
+        valid_end: float | None = None,
     ) -> str:
         """Record an analyst-made association.
 
@@ -175,13 +213,21 @@ class InvestigationStore:
         relation = str(relation)
         if cause == effect:
             raise ImportError("manual link cannot connect an event to itself")
+        existing = self._manual_links.get(str(link_id)) if link_id is not None else None
         if link_id is None:
-            link_id = f"link-{len(self._manual_links) + 1}-{abs(hash((cause, effect, relation))) % 10_000}"
+            link_id = f"link-{len(self._manual_judgments) + 1}"
         link_id = str(link_id)
         refs = tuple(
             r if isinstance(r, RecordRef) else RecordRef(r[0], r[1])
             for r in retracts
         )
+        if existing is not None:
+            refs += (existing.claim(),)
+        valid_start = self._coerce_time(valid_start)
+        valid_end = self._coerce_time(valid_end)
+        if valid_start is not None and valid_end is not None and valid_start > valid_end:
+            raise ImportError("manual link valid_start cannot be later than valid_end")
+        created_at = time.time()
         link = ManualLink(
             link_id=link_id,
             cause=cause,
@@ -191,10 +237,23 @@ class InvestigationStore:
             confidence=float(confidence),
             scopes=tuple(str(s) for s in scopes),
             retracts=refs,
-            created_at=time.time(),
+            created_at=created_at,
+            valid_start=valid_start,
+            valid_end=valid_end,
         )
         self._manual_links[link_id] = link
-        self._rebuild(affected_manual={link})
+        if existing is not None:
+            self._manual_judgments.append(ManualJudgment(
+                link_id=link_id, action="superseded", link=existing,
+                recorded_at=created_at, note=note))
+        self._manual_judgments.append(ManualJudgment(
+            link_id=link_id,
+            action="revised" if existing is not None else "created",
+            link=link, recorded_at=created_at, note=note))
+        affected = {link}
+        if existing is not None:
+            affected.add(existing)
+        self._rebuild(affected_manual=affected)
         return link_id
 
     def retract_manual_link(self, link_id: str) -> bool:
@@ -203,11 +262,29 @@ class InvestigationStore:
         if link is None:
             return False
         del self._manual_links[str(link_id)]
-        self._rebuild(affected_manual={link})
+        recorded_at = time.time()
+        revision = sum(1 for judgment in self._manual_judgments
+                       if judgment.link_id == link_id) + 1
+        retraction = ManualLink(
+            link_id=f"{link_id}#retraction-{revision}",
+            cause=link.cause, effect=link.effect, relation=link.relation,
+            note="manual judgment retracted", confidence=1.0,
+            retracts=(link.claim(),), created_at=recorded_at,
+            valid_start=link.valid_start, valid_end=link.valid_end)
+        self._manual_judgments.extend([
+            ManualJudgment(link_id=link_id, action="retracted", link=link,
+                           recorded_at=recorded_at),
+            ManualJudgment(link_id=retraction.link_id, action="retraction",
+                           link=retraction, recorded_at=recorded_at),
+        ])
+        self._rebuild(affected_manual={link, retraction})
         return True
 
     def manual_links(self) -> list[ManualLink]:
         return [self._manual_links[k] for k in sorted(self._manual_links)]
+
+    def manual_judgments(self) -> list[ManualJudgment]:
+        return list(self._manual_judgments)
 
     def sources(self) -> list[Source]:
         return [self._sources[key] for key in sorted(self._sources)]
@@ -229,6 +306,15 @@ class InvestigationStore:
         if "event_id" not in out or not out["event_id"]:
             out["event_id"] = f"{source_id}:{out['record_id']}"
         out["refs"] = [dict(r) for r in (out.get("refs") or ())]
+        for ref in out["refs"]:
+            if "valid_start" in ref:
+                ref["valid_start"] = self._coerce_time(ref.get("valid_start"))
+            if "valid_end" in ref:
+                ref["valid_end"] = self._coerce_time(ref.get("valid_end"))
+            if (ref.get("valid_start") is not None
+                    and ref.get("valid_end") is not None
+                    and ref["valid_start"] > ref["valid_end"]):
+                raise ImportError("ref valid_start cannot be later than valid_end")
         retract = out.get("retracts")
         out["retracts"] = [dict(r) if isinstance(r, dict) else {"target": r}
                             for r in (retract or ())]
@@ -259,6 +345,15 @@ class InvestigationStore:
         except TypeError:
             return frozenset(default)
 
+    @staticmethod
+    def _coerce_time(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _rebuild(self, *, affected_source: str | None = None,
                  affected_manual: set[ManualLink] | None = None) -> None:
         """Rebuild derived graph, hypotheses, and invalidate touched paths.
@@ -272,6 +367,7 @@ class InvestigationStore:
         # 1. Aggregate events across sources.
         merged: dict[str, Event] = {}
         aliases: dict[str, set[str]] = defaultdict(set)
+        ref_counts: dict[str, int] = defaultdict(int)
         for source_id in sorted(self._records):
             for record_id in sorted(self._records[source_id]):
                 record = self._records[source_id][record_id]
@@ -297,6 +393,7 @@ class InvestigationStore:
                     if event.ts is None and record.get("ts") is not None:
                         event.ts = record.get("ts")
                 event.claims.add(claim)
+                ref_counts[event_id] += len(record.get("refs", ()) or ())
                 event.aliases.add(event_id)
                 aliases[event_id].add(event_id)
                 for alias in record.get("aliases", ()) or ():
@@ -333,8 +430,11 @@ class InvestigationStore:
         alias_index: dict[str, str] = {}
         for root in sorted(groups):
             members = sorted(groups[root])
-            base = merged[members[0]]
-            for other_id in members[1:]:
+            canonical_id = min(members, key=lambda event_id: (
+                ref_counts[event_id] == 0, -ref_counts[event_id], event_id))
+            base = merged[canonical_id]
+            members = [member for member in members if member != canonical_id]
+            for other_id in members:
                 other = merged[other_id]
                 if base.kind != other.kind:
                     raise ImportError(
@@ -347,9 +447,9 @@ class InvestigationStore:
                 base.attrs = {**other.attrs, **base.attrs}
                 if base.ts is None:
                     base.ts = other.ts
-            canonical[root] = base
+            canonical[canonical_id] = base
             for alias in base.aliases:
-                alias_index[alias] = root
+                alias_index[alias] = canonical_id
 
         # 3. Collect per-claim metadata, retractions and manual claims.
         claim_meta: dict[RecordRef, tuple[float, frozenset[str]]] = {}
@@ -377,13 +477,18 @@ class InvestigationStore:
             )
             for target in link.retracts:
                 retractions[claim].add(target)
+        for judgment in self._manual_judgments:
+            if judgment.action == "retraction" and judgment.link is not None:
+                claim_meta.setdefault(judgment.link.claim(), (1.0, frozenset({"manual"})))
+                for target in judgment.link.retracts:
+                    retractions[judgment.link.claim()].add(target)
 
         global_retracted: set[RecordRef] = set()
         for targets in retractions.values():
             global_retracted |= targets
 
         # 4. Resolve every explicit reference into a raw claim or a pending.
-        edge_claims: dict[tuple[str, str, str], set[RecordRef]] = defaultdict(set)
+        edge_claims: dict[tuple[str, str, str], set[tuple[RecordRef, float | None, float | None]]] = defaultdict(set)
         pending: dict[tuple[str, str, str, str, str, str], PendingRef] = {}
         for source_id in sorted(self._records):
             for record_id in sorted(self._records[source_id]):
@@ -410,7 +515,8 @@ class InvestigationStore:
                         cause, effect = claimant, resolved
                     if cause == effect:
                         continue
-                    edge_claims[(cause, effect, relation)].add(claim)
+                    edge_claims[(cause, effect, relation)].add(
+                        (claim, ref.get("valid_start"), ref.get("valid_end")))
 
         # 5. Analyst-asserted links contribute claims just like records do.
         for link in self._manual_links.values():
@@ -425,19 +531,20 @@ class InvestigationStore:
                 continue
             if resolved_cause == resolved_effect:
                 continue
-            edge_claims[(resolved_cause, resolved_effect, link.relation)].add(claim)
+            edge_claims[(resolved_cause, resolved_effect, link.relation)].add(
+                (claim, link.valid_start, link.valid_end))
 
         # 6. Group raw claims into competing hypotheses per (effect, rel).
         hypotheses: dict[str, Hypothesis] = {}
-        grouped: dict[tuple[str, str], dict[str, tuple[set[RecordRef], set[str]]]] = \
-            defaultdict(lambda: defaultdict(lambda: (set(), set())))
-        for (cause_id, effect_id, relation), claims in edge_claims.items():
-            slot = grouped[(effect_id, relation)]
-            entry = slot[cause_id]
-            entry[0].update(claims)
+        grouped: dict[tuple[str, str, float | None, float | None], dict[str, set[tuple[RecordRef, float | None, float | None]]]] = defaultdict(lambda: defaultdict(set))
+        for (cause_id, effect_id, relation), claim_entries in edge_claims.items():
+            for claim, valid_start, valid_end in claim_entries:
+                slot_key = (effect_id, relation, valid_start, valid_end)
+                grouped[slot_key][cause_id].add((claim, valid_start, valid_end))
 
-        for (effect_id, relation), by_cause in grouped.items():
-            for cause_id, (claims, _unused) in by_cause.items():
+        for (effect_id, relation, valid_start, valid_end), by_cause in grouped.items():
+            for cause_id, claim_entries in by_cause.items():
+                claims = {entry[0] for entry in claim_entries}
                 retracted = {c for c in claims if c in global_retracted}
                 scopes: set[str] = set()
                 confidences: list[float] = []
@@ -448,7 +555,8 @@ class InvestigationStore:
                     confidences.append(conf)
                     scopes |= claim_scopes
                     origins.add(claim.source_id)
-                hypothesis_id = Hypothesis.make_id(effect_id, relation, cause_id)
+                hypothesis_id = Hypothesis.make_id(
+                    effect_id, relation, cause_id, valid_start, valid_end)
                 hypotheses[hypothesis_id] = Hypothesis(
                     hypothesis_id=hypothesis_id,
                     effect_id=effect_id,
@@ -459,22 +567,54 @@ class InvestigationStore:
                     scopes=frozenset(scopes),
                     confidence=(max(confidences) if confidences else 0.5),
                     origins=frozenset(origins),
+                    valid_start=valid_start,
+                    valid_end=valid_end,
                 )
 
-        # 7. Repair analyst working sets (drops/retractions pruned) and
-        #    determine which saved paths actually changed.
+        for hypothesis_id, historical in self._hypothesis_ledger.items():
+            current = hypotheses.get(hypothesis_id)
+            if current is None:
+                retracted = historical.claims | historical.retracted_claims
+                hypotheses[hypothesis_id] = Hypothesis(
+                    hypothesis_id=historical.hypothesis_id,
+                    effect_id=historical.effect_id,
+                    relation=historical.relation,
+                    cause_id=historical.cause_id,
+                    claims=historical.claims,
+                    retracted_claims=frozenset(retracted),
+                    scopes=historical.scopes,
+                    confidence=historical.confidence,
+                    origins=historical.origins,
+                    valid_start=historical.valid_start,
+                    valid_end=historical.valid_end,
+                )
+            else:
+                hypotheses[hypothesis_id] = Hypothesis(
+                    hypothesis_id=current.hypothesis_id,
+                    effect_id=current.effect_id,
+                    relation=current.relation,
+                    cause_id=current.cause_id,
+                    claims=historical.claims | current.claims,
+                    retracted_claims=(
+                        current.retracted_claims
+                        | (historical.claims - current.claims)),
+                    scopes=historical.scopes | current.scopes,
+                    confidence=max(historical.confidence, current.confidence),
+                    origins=historical.origins | current.origins,
+                    valid_start=current.valid_start,
+                    valid_end=current.valid_end,
+                )
+
+        # 7. Preserve analyst sets exactly and determine which saved paths
+        #    actually changed.  Missing selected candidates remain recorded
+        #    so later reviews can show why the saved judgment no longer maps
+        #    to live evidence.
         live_ids = set(hypotheses)
         pruned_sets: dict[str, set[str]] = {}
         for set_id, hyp_set in list(self._hyp_sets.items()):
-            kept = hyp_set.hypothesis_ids & live_ids
-            if kept != hyp_set.hypothesis_ids:
-                pruned_sets[set_id] = set(hyp_set.hypothesis_ids - kept)
-                self._hyp_sets[set_id] = HypothesisSet(
-                    set_id=set_id,
-                    hypothesis_ids=kept,
-                    description=hyp_set.description,
-                    created_at=hyp_set.created_at,
-                )
+            missing = set(hyp_set.hypothesis_ids) - live_ids
+            if missing:
+                pruned_sets[set_id] = missing
 
         changed_anchors = self._changed_anchors(
             affected_source=affected_source,
@@ -489,15 +629,18 @@ class InvestigationStore:
         self._events = canonical
         self._alias_index = alias_index
         self._edges = {
-            key: Edge(key[0], key[1], key[2], frozenset(claims))
-            for key, claims in edge_claims.items()
+            key: Edge(key[0], key[1], key[2],
+                      frozenset(entry[0] for entry in claim_entries))
+            for key, claim_entries in edge_claims.items()
         }
         self._pending = pending
         self._hypotheses = hypotheses
+        self._hypothesis_ledger = dict(hypotheses)
         self._claim_meta = claim_meta
         self._retractions = {k: frozenset(v) for k, v in retractions.items()}
         for state in self._paths.values():
-            if (state.anchors & changed_anchors
+            changed = state.anchors if state.at_time is None else state.edge_anchors
+            if (changed & changed_anchors
                     or any(a not in live_nodes for a in state.anchors)
                     or not state.valid):
                 state.valid = False
@@ -595,15 +738,32 @@ class InvestigationStore:
                 h = old or new
                 touch_hypothesis(h)
                 continue
-            if (old.claims != new.claims
-                    or old.retracted_claims != new.retracted_claims):
+            evidence_changed = (old.claims != new.claims
+                                or old.retracted_claims != new.retracted_claims)
+            window_changed = (old.valid_start != new.valid_start
+                              or old.valid_end != new.valid_end)
+            if evidence_changed:
                 touch_hypothesis(new)
+            elif window_changed:
+                for state in self._paths.values():
+                    if state.at_time is None or (
+                            self._hypothesis_applies_at(old, state.at_time)
+                            or self._hypothesis_applies_at(new, state.at_time)):
+                        changed.add(old.effect_id)
+                        changed.add(old.cause_id)
 
         for set_id, missing in pruned_sets.items():
             for state in self._paths.values():
                 if state.set_id == set_id:
                     state.valid = False
         return changed
+
+    @staticmethod
+    def _hypothesis_applies_at(hypothesis: Hypothesis,
+                               moment: float | None) -> bool:
+        if moment is None:
+            return True
+        return hypothesis.active_at(moment)
 
     # ---------------------------------------------------------------- access
 
@@ -629,22 +789,54 @@ class InvestigationStore:
 
     # ----------------------------------------------------------- hypotheses
 
-    def hypotheses(self, include_retracted: bool = False) -> list[Hypothesis]:
+    def hypotheses(self, include_retracted: bool = False,
+                   at_time: float | None = None) -> list[Hypothesis]:
         items = [h for h in self._hypotheses.values()
-                 if include_retracted or not h.is_retracted]
+                 if (include_retracted or not h.is_retracted)
+                 and h.active_at(at_time)]
         return sorted(items, key=lambda h: (h.effect_id, h.relation,
+                                            h.valid_start if h.valid_start is not None else float("-inf"),
+                                            h.valid_end if h.valid_end is not None else float("inf"),
                                             -h.confidence, h.cause_id))
 
-    def conflict_groups(self, include_retracted: bool = False
+    def conflict_groups(self, include_retracted: bool = False,
+                        at_time: float | None = None
                         ) -> list[ConflictGroup]:
         slots: dict[tuple[str, str], list[Hypothesis]] = defaultdict(list)
-        for hypothesis in self.hypotheses(include_retracted=include_retracted):
+        for hypothesis in self.hypotheses(include_retracted=include_retracted,
+                                         at_time=at_time):
             slots[(hypothesis.effect_id, hypothesis.relation)].append(hypothesis)
-        groups = [ConflictGroup(effect_id=effect_id, relation=relation,
-                                hypotheses=hyps)
-                  for (effect_id, relation), hyps in sorted(slots.items())
-                  if len(hyps) > 1]
+        groups: list[ConflictGroup] = []
+        for (effect_id, relation), hyps in sorted(slots.items()):
+            clusters: list[list[Hypothesis]] = []
+            for hypothesis in hyps:
+                placed = False
+                for cluster in clusters:
+                    if any(self._windows_overlap(hypothesis, other)
+                           for other in cluster):
+                        cluster.append(hypothesis)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([hypothesis])
+            for cluster in clusters:
+                if len(cluster) > 1:
+                    groups.append(ConflictGroup(effect_id=effect_id,
+                                                relation=relation,
+                                                hypotheses=cluster))
         return groups
+
+    @staticmethod
+    def _windows_overlap(left: Hypothesis, right: Hypothesis) -> bool:
+        if left.valid_start is None and left.valid_end is None:
+            return True
+        if right.valid_start is None and right.valid_end is None:
+            return True
+        left_start = left.valid_start if left.valid_start is not None else float("-inf")
+        left_end = left.valid_end if left.valid_end is not None else float("inf")
+        right_start = right.valid_start if right.valid_start is not None else float("-inf")
+        right_end = right.valid_end if right.valid_end is not None else float("inf")
+        return left_start <= right_end and right_start <= left_end
 
     def hypothesis_evidence(self, hypothesis_id: str) -> Hypothesis:
         return self._hypotheses[hypothesis_id]
@@ -661,24 +853,43 @@ class InvestigationStore:
     def create_hypothesis_set(
         self, set_id: str, hypothesis_ids: Iterable[str],
         description: str = "", activate: bool = False,
+        excluded_hypothesis_ids: Iterable[str] = (),
+        judgments: dict[str, str] | None = None,
     ) -> HypothesisSet:
-        """Pin one explanation per disputed slot for continued tracking."""
+        """Save a complete, independently reopenable group of judgments."""
         if not set_id or not isinstance(set_id, str):
             raise ImportError("set_id must be a non-empty string")
+        if set_id in self._hyp_sets:
+            raise ImportError(f"hypothesis set {set_id!r} already exists; "
+                              "saved hypothesis groups are append-only")
         selected = {str(h) for h in hypothesis_ids}
         unknown = selected - set(self._hypotheses)
         if unknown:
             raise KeyError(f"unknown hypothesis ids: {sorted(unknown)}")
-        slots = [(self._hypotheses[h].effect_id, self._hypotheses[h].relation)
-                 for h in selected]
-        if len(slots) != len(set(slots)):
+        selected_hyps = [self._hypotheses[h] for h in selected]
+        for index, left in enumerate(selected_hyps):
+            for right in selected_hyps[index + 1:]:
+                if (left.effect_id == right.effect_id
+                        and left.relation == right.relation
+                        and left.cause_id != right.cause_id
+                        and self._windows_overlap(left, right)):
+                    raise ImportError(
+                        "a hypothesis set may pick at most one overlapping "
+                        "explanation per (effect, relation) slot")
+        excluded = {str(h) for h in excluded_hypothesis_ids}
+        unknown |= excluded - set(self._hypotheses)
+        if unknown:
+            raise KeyError(f"unknown hypothesis ids: {sorted(unknown)}")
+        overlap = selected & excluded
+        if overlap:
             raise ImportError(
-                "a hypothesis set may pick at most one explanation per "
-                "(effect, relation) slot")
+                "a hypothesis cannot be both selected and explicitly excluded")
         hyp_set = HypothesisSet(set_id=set_id,
                                 hypothesis_ids=frozenset(selected),
                                 description=description,
-                                created_at=time.time())
+                                created_at=time.time(),
+                                excluded_hypothesis_ids=frozenset(excluded),
+                                judgments=dict(judgments or {}))
         self._hyp_sets[set_id] = hyp_set
         if activate:
             self.active_set = set_id
@@ -695,7 +906,62 @@ class InvestigationStore:
             raise KeyError(f"unknown hypothesis set: {set_id!r}")
         self.active_set = set_id
 
-    def _selected_edges(self, set_id: str | None
+    def explain_hypothesis_set(
+        self, set_id: str, *, max_depth: int | None = None,
+        at_time: float | None = None,
+    ) -> HypothesisSetExplanation:
+        hyp_set = self._hyp_sets[set_id]
+        selected = tuple(self._hypotheses[h] for h in sorted(hyp_set.hypothesis_ids)
+                         if h in self._hypotheses)
+        excluded = tuple(self._hypotheses[h]
+                         for h in sorted(hyp_set.excluded_hypothesis_ids)
+                         if h in self._hypotheses)
+        explained: set[str] = set()
+        unresolved: set[PendingRef] = set()
+        conflicting: set[str] = set()
+        for hypothesis in selected:
+            result = self.trace(hypothesis.effect_id, max_depth,
+                                set_id=set_id, at_time=at_time)
+            explained.update(result.events)
+            unresolved.update(result.unresolved)
+        for hypothesis in selected:
+            selected_sources = {claim.source_id for claim in hypothesis.claims}
+            for other in self._hypotheses.values():
+                if (other.effect_id == hypothesis.effect_id
+                        and other.relation == hypothesis.relation
+                        and other.cause_id != hypothesis.cause_id
+                        and self._windows_overlap(other, hypothesis)):
+                    conflicting.update(
+                        claim.source_id for claim in other.active_claims
+                        if claim.source_id not in selected_sources)
+        unexplained = {ref.claimant_id for ref in unresolved}
+        for hypothesis_id in hyp_set.hypothesis_ids:
+            hypothesis = self._hypotheses.get(hypothesis_id)
+            if hypothesis is None or hypothesis.is_retracted or not hypothesis.active_at(at_time):
+                unexplained.add(self._missing_set_effect(hypothesis_id))
+        return HypothesisSetExplanation(
+            set_id=set_id,
+            selected=selected,
+            excluded=excluded,
+            explained_events=tuple(sorted(explained)),
+            conflicting_sources=tuple(sorted(conflicting)),
+            unexplained_events=tuple(sorted(v for v in unexplained if v)),
+            unresolved=tuple(sorted(unresolved,
+                                    key=lambda p: (p.claimant_id, p.relation,
+                                                   p.target, p.claim.source_id))),
+        )
+
+    @staticmethod
+    def _missing_set_effect(hypothesis_id: str) -> str:
+        try:
+            _, rest = hypothesis_id.split("h:", 1)
+            effect, _ = rest.split("#", 1)
+            return effect
+        except ValueError:
+            return ""
+
+    def _selected_edges(self, set_id: str | None,
+                        at_time: float | None = None
                         ) -> tuple[dict[tuple[str, str, str], Edge], bool]:
         """Edges visible under a working set.
 
@@ -703,20 +969,51 @@ class InvestigationStore:
         only the set's pick is traversed; raw evidence for the rejected
         alternatives is still retained on the Hypothesis objects.
         """
+        active_hypotheses = [h for h in self._hypotheses.values()
+                             if h.active_at(at_time)]
         if set_id is None:
-            return dict(self._edges), False
+            edges: dict[tuple[str, str, str], Edge] = {}
+            for h in active_hypotheses:
+                if h.is_retracted:
+                    continue
+                key = (h.cause_id, h.effect_id, h.relation)
+                existing = edges.get(key)
+                claims = h.active_claims
+                if existing is not None:
+                    claims |= existing.claims
+                edges[key] = Edge(key[0], key[1], key[2], frozenset(claims))
+            return edges, False
         chosen = self._hyp_sets[set_id].hypothesis_ids
-        disputed_slots = {(g.effect_id, g.relation)
-                          for g in self.conflict_groups(include_retracted=True)}
-        edges: dict[tuple[str, str, str], Edge] = {}
+        edges = {}
         for hypothesis_id in chosen:
-            h = self._hypotheses[hypothesis_id]
-            edges[(h.cause_id, h.effect_id, h.relation)] = Edge(
-                h.cause_id, h.effect_id, h.relation,
-                h.active_claims or h.claims)
-        for key, edge in self._edges.items():
-            if (key[1], key[2]) not in disputed_slots:
-                edges[key] = edge
+            h = self._hypotheses.get(hypothesis_id)
+            if h is not None and h.active_at(at_time) and not h.is_retracted:
+                edges[(h.cause_id, h.effect_id, h.relation)] = Edge(
+                    h.cause_id, h.effect_id, h.relation,
+                    h.active_claims or h.claims)
+        ambiguous: set[tuple[str, str, float | None, float | None]] = set()
+        for index, left in enumerate(active_hypotheses):
+            for right in active_hypotheses[index + 1:]:
+                if (left.effect_id == right.effect_id
+                        and left.relation == right.relation
+                        and left.cause_id != right.cause_id
+                        and self._windows_overlap(left, right)):
+                    ambiguous.add((left.effect_id, left.relation,
+                                   left.valid_start, left.valid_end))
+                    ambiguous.add((right.effect_id, right.relation,
+                                   right.valid_start, right.valid_end))
+        for h in active_hypotheses:
+            if h.is_retracted:
+                continue
+            slot = (h.effect_id, h.relation, h.valid_start, h.valid_end)
+            if slot in ambiguous:
+                continue
+            key = (h.cause_id, h.effect_id, h.relation)
+            existing = edges.get(key)
+            claims = h.active_claims
+            if existing is not None:
+                claims |= existing.claims
+            edges[key] = Edge(key[0], key[1], key[2], frozenset(claims))
         return edges, True
 
     # ---------------------------------------------------------------- tracing
@@ -728,6 +1025,7 @@ class InvestigationStore:
         use_set: bool | None = None,
         save: bool = False,
         refresh: bool = False,
+        at_time: float | None = None,
     ) -> TraceResult:
         """Walk explicit causal links in both directions from one event.
 
@@ -748,13 +1046,13 @@ class InvestigationStore:
             raise KeyError(f"unknown event or alias: {seed!r}")
         origin_id = origin.event_id
         depth_key = max_depth
-        cache_key = (origin_id, set_id, depth_key)
+        cache_key = (origin_id, set_id, depth_key, at_time)
         if (not refresh) and (save or cache_key in self._paths):
             state = self._paths.get(cache_key)
             if state is not None and state.valid:
                 return state.result
 
-        edge_view, _ = self._selected_edges(set_id)
+        edge_view, _ = self._selected_edges(set_id, at_time=at_time)
         out_adj: dict[str, list[Edge]] = defaultdict(list)
         in_adj: dict[str, list[Edge]] = defaultdict(list)
         for edge in edge_view.values():
@@ -809,13 +1107,17 @@ class InvestigationStore:
                 anchors.add(hop.effect_id)
             self._paths[cache_key] = PathState(
                 seed=origin_id, set_id=set_id, max_depth=depth_key,
+                at_time=at_time,
                 result=result, reached=frozenset(reached),
-                anchors=frozenset(anchors))
+                anchors=frozenset(anchors),
+                edge_anchors=frozenset(anchors - {origin_id}))
         return result
 
     def saved_paths(self) -> list[PathState]:
         return [self._paths[k] for k in sorted(self._paths,
-                                               key=lambda item: (item[0], item[1] or "", item[2] or -1))]
+                                               key=lambda item: (item[0], item[1] or "",
+                                                                 item[2] or -1,
+                                                                 item[3] if item[3] is not None else float("-inf")))]
 
     def stale_paths(self) -> list[PathState]:
         return [state for state in self.saved_paths() if not state.valid]
@@ -824,7 +1126,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 3,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -848,6 +1150,8 @@ class InvestigationStore:
                     "scopes": list(link.scopes),
                     "retracts": [r.as_dict() for r in link.retracts],
                     "created_at": link.created_at,
+                    "valid_start": link.valid_start,
+                    "valid_end": link.valid_end,
                 }
                 for link in self.manual_links()
             ],
@@ -855,15 +1159,25 @@ class InvestigationStore:
                 {"set_id": hyp_set.set_id,
                  "hypothesis_ids": sorted(hyp_set.hypothesis_ids),
                  "description": hyp_set.description,
-                 "created_at": hyp_set.created_at}
+                 "created_at": hyp_set.created_at,
+                 "excluded_hypothesis_ids": sorted(hyp_set.excluded_hypothesis_ids),
+                 "judgments": hyp_set.judgments}
                 for hyp_set in self.hypothesis_sets()
             ],
             "active_set": self.active_set,
             "saved_paths": [
                 {"seed": state.seed, "set_id": state.set_id,
-                 "max_depth": state.max_depth, "valid": state.valid}
+                 "max_depth": state.max_depth, "at_time": state.at_time,
+                 "valid": state.valid}
                 for state in self.saved_paths()
             ],
+            "manual_judgments": [
+                {"link_id": judgment.link_id, "action": judgment.action,
+                 "recorded_at": judgment.recorded_at, "note": judgment.note,
+                 "link": self._manual_link_to_judgment_dict(judgment.link)}
+                for judgment in self._manual_judgments
+            ],
+            "hypothesis_ledger": [h.as_dict() for h in self._hypothesis_ledger.values()],
         }
 
     @staticmethod
@@ -873,9 +1187,24 @@ class InvestigationStore:
             for key, value in record.items()
         }
 
+    @staticmethod
+    def _manual_link_to_judgment_dict(link: ManualLink | None) -> dict[str, Any] | None:
+        if link is None:
+            return None
+        return {
+            "link_id": link.link_id, "cause": link.cause,
+            "effect": link.effect, "relation": link.relation,
+            "note": link.note, "confidence": link.confidence,
+            "scopes": list(link.scopes),
+            "retracts": [r.as_dict() for r in link.retracts],
+            "created_at": link.created_at,
+            "valid_start": link.valid_start,
+            "valid_end": link.valid_end,
+        }
+
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2):
+        if data.get("version") not in (1, 2, 3):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -897,25 +1226,73 @@ class InvestigationStore:
                 retracts=tuple(RecordRef(r["source_id"], r["record_id"])
                                for r in link.get("retracts", ())),
                 created_at=link.get("created_at"),
+                valid_start=link.get("valid_start"),
+                valid_end=link.get("valid_end"),
             )
             store._manual_links[created.link_id] = created
         store._rebuild()
+        for item in data.get("hypothesis_ledger", ()):
+            hypothesis = Hypothesis(
+                hypothesis_id=item["hypothesis_id"],
+                effect_id=item["effect_id"], relation=item["relation"],
+                cause_id=item["cause_id"],
+                claims=frozenset(RecordRef(c["source_id"], c["record_id"])
+                                for c in item.get("claims", ())),
+                retracted_claims=frozenset(
+                    RecordRef(c["source_id"], c["record_id"])
+                    for c in item.get("retracted_claims", ())),
+                scopes=frozenset(item.get("scopes", ())),
+                confidence=item.get("confidence", 0.5),
+                origins=frozenset(item.get("origins", ())),
+                valid_start=item.get("valid_start"),
+                valid_end=item.get("valid_end"))
+            store._hypothesis_ledger[hypothesis.hypothesis_id] = hypothesis
+            store._hypotheses.setdefault(hypothesis.hypothesis_id, hypothesis)
         for hyp_set in data.get("hypothesis_sets", ()):
-            ids = frozenset(hyp_set["hypothesis_ids"]) & set(store._hypotheses)
+            ids = frozenset(hyp_set["hypothesis_ids"])
             store._hyp_sets[hyp_set["set_id"]] = HypothesisSet(
                 set_id=hyp_set["set_id"], hypothesis_ids=ids,
                 description=hyp_set.get("description", ""),
-                created_at=hyp_set.get("created_at"))
+                created_at=hyp_set.get("created_at"),
+                excluded_hypothesis_ids=frozenset(
+                    hyp_set.get("excluded_hypothesis_ids", ())),
+                judgments=dict(hyp_set.get("judgments", {})))
         active = data.get("active_set")
         store.active_set = active if active in store._hyp_sets else None
         for item in data.get("saved_paths", ()):
             try:
                 result = store.trace(item["seed"], item.get("max_depth"),
                                      set_id=item.get("set_id"),
-                                     save=True, refresh=True)
+                                     save=True, refresh=True,
+                                     at_time=item.get("at_time"))
             except KeyError:
                 continue
             state = store._paths[(result.origin_id, item.get("set_id"),
-                                  item.get("max_depth"))]
+                                  item.get("max_depth"), item.get("at_time"))]
             state.valid = item.get("valid", True)
+        for item in data.get("manual_judgments", ()):
+            link_data = item.get("link")
+            judgment_link = None
+            if link_data is not None:
+                judgment_link = ManualLink(
+                    link_id=link_data["link_id"], cause=link_data["cause"],
+                    effect=link_data["effect"],
+                    relation=link_data["relation"],
+                    note=link_data.get("note", ""),
+                    confidence=link_data.get("confidence", 0.5),
+                    scopes=tuple(link_data.get("scopes", ["manual"])),
+                    retracts=tuple(RecordRef(r["source_id"], r["record_id"])
+                                   for r in link_data.get("retracts", ())),
+                    created_at=link_data.get("created_at"),
+                    valid_start=link_data.get("valid_start"),
+                    valid_end=link_data.get("valid_end"))
+            store._manual_judgments.append(ManualJudgment(
+                link_id=item["link_id"], action=item.get("action", "created"),
+                link=judgment_link, recorded_at=item.get("recorded_at"),
+                note=item.get("note", "")))
+        if not data.get("manual_judgments"):
+            for link in store.manual_links():
+                store._manual_judgments.append(ManualJudgment(
+                    link_id=link.link_id, action="created", link=link,
+                    recorded_at=link.created_at))
         return store
