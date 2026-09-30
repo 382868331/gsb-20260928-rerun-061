@@ -13,9 +13,13 @@ from .models import (
 from .store import ImportError as InvestigationImportError
 from .store import (
     ConflictGroup,
+    HypothesisSetReport,
     HypothesisSet,
     InvestigationStore,
+    ManualLinkStatus,
     PathState,
+    SavedGroup,
+    SetPathComparison,
     TraceResult,
 )
 
@@ -30,7 +34,11 @@ __all__ = [
     "MANUAL_SOURCE",
     "ConflictGroup",
     "HypothesisSet",
+    "HypothesisSetReport",
+    "ManualLinkStatus",
     "PathState",
+    "SavedGroup",
+    "SetPathComparison",
     "Casebook",
     "FindingComparison",
     "PathDiff",

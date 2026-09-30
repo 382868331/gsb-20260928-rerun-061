@@ -69,6 +69,54 @@ class PathState:
     reached: frozenset[str]
     anchors: frozenset[str]
     valid: bool = True
+    at: float | None = None
+
+
+@dataclass(frozen=True)
+class ManualLinkStatus:
+    """Whether a time-bounded analyst judgment currently applies."""
+
+    link: ManualLink
+    active: bool
+    reason: str = ""
+
+
+@dataclass
+class HypothesisSetReport:
+    """What one hypothesis group explains, conflicts with, and misses."""
+
+    set_id: str
+    explained_events: tuple[str, ...]
+    selections: tuple[tuple[str, str, str], ...]  # (effect, relation, hypothesis_id)
+    rejected_hypotheses: tuple[str, ...]
+    conflicting_sources: tuple[str, ...]
+    unexplained_slots: tuple[tuple[str, str], ...]
+    unresolved_refs: tuple[PendingRef, ...]
+
+
+@dataclass
+class SetPathComparison:
+    """Whole propagation paths of several hypothesis groups side by side."""
+
+    seed: str
+    set_ids: tuple[str | None, ...]
+    traces: dict[str | None, TraceResult]
+    shared_hops: tuple[EdgeHop, ...]
+    unique_hops: dict[str | None, tuple[EdgeHop, ...]]
+
+
+@dataclass
+class SavedGroup:
+    """A frozen hypothesis group: selection plus every rejected candidate
+    and the rationale for excluding it.  Append-only: reopening never
+    deletes the original candidates or their exclusion reasons."""
+
+    group_id: str
+    set_id: str
+    note: str
+    created_at: float | None
+    selected: tuple[dict[str, Any], ...]
+    excluded: tuple[dict[str, Any], ...]
 
 
 class InvestigationStore:
@@ -100,7 +148,11 @@ class InvestigationStore:
         self._hyp_sets: dict[str, HypothesisSet] = {}
         self.active_set: str | None = None
         # Saved investigation paths, invalidated incrementally on change.
-        self._paths: dict[tuple[str, str | None, int | None], PathState] = {}
+        self._paths: dict[tuple[str, str | None, int | None, float | None], PathState] = {}
+        # Manual links whose time window excludes the events they name.
+        self._manual_inactive: dict[str, str] = {}
+        # Append-only archive of saved hypothesis groups.
+        self._saved_groups: dict[str, SavedGroup] = {}
 
     # ---------------------------------------------------------------- import
 
@@ -164,17 +216,24 @@ class InvestigationStore:
         confidence: float = 0.5,
         scopes: Iterable[str] = ("manual",),
         retracts: Iterable[RecordRef | tuple[str, str]] = (),
+        valid_from: float | None = None,
+        valid_to: float | None = None,
     ) -> str:
         """Record an analyst-made association.
 
         The link is first-class evidence with its own provenance; it never
-        silently merges with a source claim and can be revoked on its own.
+         silently merges with a source claim and can be revoked on its own.
+        ``valid_from``/``valid_to`` bound the judgment to a time range: a
+        local judgment is never generalized to the object's whole history.
         """
         cause = str(cause)
         effect = str(effect)
         relation = str(relation)
         if cause == effect:
             raise ImportError("manual link cannot connect an event to itself")
+        if valid_from is not None and valid_to is not None \
+                and float(valid_from) > float(valid_to):
+            raise ImportError("valid_from must not be after valid_to")
         if link_id is None:
             link_id = f"link-{len(self._manual_links) + 1}-{abs(hash((cause, effect, relation))) % 10_000}"
         link_id = str(link_id)
@@ -192,10 +251,40 @@ class InvestigationStore:
             scopes=tuple(str(s) for s in scopes),
             retracts=refs,
             created_at=time.time(),
+            valid_from=None if valid_from is None else float(valid_from),
+            valid_to=None if valid_to is None else float(valid_to),
         )
         self._manual_links[link_id] = link
         self._rebuild(affected_manual={link})
         return link_id
+
+    def adjust_manual_link_window(
+        self, link_id: str,
+        valid_from: float | None = None,
+        valid_to: float | None = None,
+    ) -> bool:
+        """Adjust the time range of one analyst judgment.
+
+        Only investigation paths whose evidence actually changed are
+        invalidated; unrelated records and paths stay untouched.
+        """
+        link = self._manual_links.get(str(link_id))
+        if link is None:
+            return False
+        if valid_from is not None and valid_to is not None \
+                and float(valid_from) > float(valid_to):
+            raise ImportError("valid_from must not be after valid_to")
+        updated = ManualLink(
+            link_id=link.link_id, cause=link.cause, effect=link.effect,
+            relation=link.relation, note=link.note,
+            confidence=link.confidence, scopes=link.scopes,
+            retracts=link.retracts, created_at=link.created_at,
+            valid_from=None if valid_from is None else float(valid_from),
+            valid_to=None if valid_to is None else float(valid_to),
+        )
+        self._manual_links[updated.link_id] = updated
+        self._rebuild(affected_manual={link, updated})
+        return True
 
     def retract_manual_link(self, link_id: str) -> bool:
         """Revoke one analyst association; only its paths are recomputed."""
@@ -208,6 +297,17 @@ class InvestigationStore:
 
     def manual_links(self) -> list[ManualLink]:
         return [self._manual_links[k] for k in sorted(self._manual_links)]
+
+    def manual_link_status(self) -> list[ManualLinkStatus]:
+        """Every analyst judgment and whether its time window applies."""
+        return [
+            ManualLinkStatus(
+                link=link,
+                active=link.link_id not in self._manual_inactive,
+                reason=self._manual_inactive.get(link.link_id, ""),
+            )
+            for link in self.manual_links()
+        ]
 
     def sources(self) -> list[Source]:
         return [self._sources[key] for key in sorted(self._sources)]
@@ -413,6 +513,10 @@ class InvestigationStore:
                     edge_claims[(cause, effect, relation)].add(claim)
 
         # 5. Analyst-asserted links contribute claims just like records do.
+        #    A time-bounded judgment applies only inside its window: if the
+        #    events it names carry timestamps outside the range, the link is
+        #    kept as evidence but stays inactive (never generalized).
+        manual_inactive: dict[str, str] = {}
         for link in self._manual_links.values():
             claim = link.claim()
             resolved_cause = self._resolve_link_end(link.cause)
@@ -424,6 +528,16 @@ class InvestigationStore:
                     link.effect, link.relation, "incoming", link.cause, claim)
                 continue
             if resolved_cause == resolved_effect:
+                continue
+            effect_event = canonical.get(resolved_effect)
+            cause_event = canonical.get(resolved_cause)
+            known_ts = next(
+                (e.ts for e in (effect_event, cause_event)
+                 if e is not None and e.ts is not None), None)
+            if not link.applies_at(known_ts):
+                manual_inactive[link.link_id] = (
+                    f"events outside window [{link.valid_from}, "
+                    f"{link.valid_to}]")
                 continue
             edge_claims[(resolved_cause, resolved_effect, link.relation)].add(claim)
 
@@ -483,6 +597,14 @@ class InvestigationStore:
             new_hypotheses=hypotheses,
             pruned_sets=pruned_sets,
         )
+        # Unresolved references are part of a path's conclusion too: a
+        # new or retracted pending ref touching a reached event
+        # invalidates that path.
+        prev_pending = self._pending
+        for key in prev_pending.keys() ^ pending.keys():
+            ref = prev_pending.get(key) or pending.get(key)
+            if ref is not None:
+                changed_anchors.add(ref.claimant_id)
         # Paths whose seed or reached nodes vanished entirely are stale too.
         live_nodes = set(canonical)
 
@@ -493,6 +615,7 @@ class InvestigationStore:
             for key, claims in edge_claims.items()
         }
         self._pending = pending
+        self._manual_inactive = manual_inactive
         self._hypotheses = hypotheses
         self._claim_meta = claim_meta
         self._retractions = {k: frozenset(v) for k, v in retractions.items()}
@@ -583,6 +706,16 @@ class InvestigationStore:
         manual_claims = {link.claim() for link in affected_manual}
         manual_retractions = {target for link in affected_manual
                               for target in link.retracts}
+        # A window adjustment keeps the same claim but changes when it
+        # applies; paths observed at a moment depend on it too.
+        window_changed: set[RecordRef] = set()
+        windows_by_claim: dict[RecordRef, set[tuple[float | None, float | None]]] = \
+            defaultdict(set)
+        for link in affected_manual:
+            windows_by_claim[link.claim()].add((link.valid_from, link.valid_to))
+        for claim, windows in windows_by_claim.items():
+            if len(windows) > 1:
+                window_changed.add(claim)
         for hypothesis in (*prev_hypotheses.values(), *new_hypotheses.values()):
             if (manual_claims & hypothesis.claims
                     or manual_retractions & hypothesis.claims):
@@ -596,7 +729,8 @@ class InvestigationStore:
                 touch_hypothesis(h)
                 continue
             if (old.claims != new.claims
-                    or old.retracted_claims != new.retracted_claims):
+                    or old.retracted_claims != new.retracted_claims
+                    or window_changed & new.claims):
                 touch_hypothesis(new)
 
         for set_id, missing in pruned_sets.items():
@@ -695,6 +829,189 @@ class InvestigationStore:
             raise KeyError(f"unknown hypothesis set: {set_id!r}")
         self.active_set = set_id
 
+    # ---------------------------------------------------- group comparison
+
+    def explain_set(self, set_id: str, seed: str | None = None,
+                    max_depth: int | None = None) -> HypothesisSetReport:
+        """Report what one hypothesis group explains and what it misses.
+
+        The report covers the whole propagation path(s) reachable under
+        the group's selections - not a single parent/child slot - and
+        lists the sources behind rejected alternatives plus the events
+        and references the group still cannot explain.
+        """
+        hyp_set = self._hyp_sets.get(set_id)
+        if hyp_set is None:
+            raise KeyError(f"unknown hypothesis set: {set_id!r}")
+        selected = [self._hypotheses[h] for h in sorted(hyp_set.hypothesis_ids)
+                    if h in self._hypotheses]
+        explained: set[str] = set()
+        for hypothesis in selected:
+            explained.add(hypothesis.cause_id)
+            explained.add(hypothesis.effect_id)
+        seeds = [seed] if seed is not None else sorted(
+            {state.seed for state in self._paths.values()
+             if state.set_id == set_id})
+        unresolved: dict[tuple[str, str, str], PendingRef] = {}
+        for one_seed in seeds:
+            try:
+                result = self.trace(one_seed, max_depth, set_id=set_id)
+            except KeyError:
+                continue
+            explained.update(result.events)
+            for hop in (*result.upstream, *result.downstream):
+                explained.add(hop.cause_id)
+                explained.add(hop.effect_id)
+            for pending_ref in result.unresolved:
+                key = (pending_ref.claimant_id, pending_ref.relation,
+                       pending_ref.target)
+                unresolved[key] = pending_ref
+        chosen_slots = {(h.effect_id, h.relation) for h in selected}
+        rejected: list[Hypothesis] = []
+        conflicting_sources: set[str] = set()
+        for hypothesis in self._hypotheses.values():
+            if (hypothesis.effect_id, hypothesis.relation) in chosen_slots \
+                    and hypothesis.hypothesis_id not in hyp_set.hypothesis_ids:
+                rejected.append(hypothesis)
+                conflicting_sources |= hypothesis.origins
+        unexplained_slots = tuple(sorted(
+            (group.effect_id, group.relation)
+            for group in self.conflict_groups()
+            if group.effect_id in explained
+            and (group.effect_id, group.relation) not in chosen_slots))
+        return HypothesisSetReport(
+            set_id=set_id,
+            explained_events=tuple(sorted(explained)),
+            selections=tuple(
+                (h.effect_id, h.relation, h.hypothesis_id) for h in selected),
+            rejected_hypotheses=tuple(
+                h.hypothesis_id for h in sorted(
+                    rejected, key=lambda item: item.hypothesis_id)),
+            conflicting_sources=tuple(sorted(conflicting_sources)),
+            unexplained_slots=unexplained_slots,
+            unresolved_refs=tuple(
+                unresolved[key] for key in sorted(unresolved)),
+        )
+
+    def compare_set_paths(
+        self, seed: str, set_ids: Iterable[str | None] | None = None,
+        max_depth: int | None = None, at: float | None = None,
+    ) -> SetPathComparison:
+        """Trace whole propagation paths under several hypothesis groups.
+
+        Every group is traced independently from the same seed; the
+        result shows the hops all groups share and the hops unique to
+        each group, so conflicting assumptions can be compared path by
+        path instead of relation by relation.
+        """
+        if set_ids is None:
+            set_ids = [None, *sorted(self._hyp_sets)]
+        set_ids = tuple(set_ids)
+        traces: dict[str | None, TraceResult] = {}
+        hop_sets: dict[str | None, set[tuple[str, str, str]]] = {}
+        for one_set in set_ids:
+            result = self.trace(seed, max_depth, set_id=one_set, at=at)
+            traces[one_set] = result
+            hop_sets[one_set] = {
+                (h.cause_id, h.relation, h.effect_id)
+                for h in (*result.upstream, *result.downstream)}
+        if hop_sets:
+            shared_keys = set.intersection(*hop_sets.values())
+        else:
+            shared_keys = set()
+
+        def hops_of(result: TraceResult) -> dict[tuple[str, str, str], EdgeHop]:
+            return {(h.cause_id, h.relation, h.effect_id): h
+                    for h in (*result.upstream, *result.downstream)}
+
+        shared: list[EdgeHop] = []
+        unique: dict[str | None, tuple[EdgeHop, ...]] = {}
+        for one_set in set_ids:
+            hops = hops_of(traces[one_set])
+            if one_set == set_ids[0]:
+                shared = [hops[key] for key in sorted(shared_keys)
+                          if key in hops]
+            unique[one_set] = tuple(
+                hops[key] for key in sorted(hop_sets[one_set] - shared_keys))
+        return SetPathComparison(
+            seed=traces[set_ids[0]].origin_id if set_ids else str(seed),
+            set_ids=set_ids, traces=traces,
+            shared_hops=tuple(shared), unique_hops=unique)
+
+    # ------------------------------------------------------- saved groups
+
+    def save_group(
+        self, set_id: str, group_id: str | None = None, note: str = "",
+        reasons: dict[str, str] | None = None,
+    ) -> str:
+        """Freeze one hypothesis group for independent reopening.
+
+        The archive keeps the selected hypotheses *and* every rejected
+        candidate with its exclusion rationale; neither is ever deleted,
+        even if the live set or the underlying evidence later changes.
+        """
+        hyp_set = self._hyp_sets.get(set_id)
+        if hyp_set is None:
+            raise KeyError(f"unknown hypothesis set: {set_id!r}")
+        if group_id is None:
+            group_id = f"group-{len(self._saved_groups) + 1}"
+        group_id = str(group_id)
+        if group_id in self._saved_groups:
+            raise ImportError(
+                f"saved group {group_id!r} already exists; "
+                "saved groups are append-only")
+        reasons = reasons or {}
+        chosen_slots = {
+            (self._hypotheses[h].effect_id, self._hypotheses[h].relation)
+            for h in hyp_set.hypothesis_ids if h in self._hypotheses}
+        selected = tuple(
+            self._hypotheses[h].as_dict()
+            for h in sorted(hyp_set.hypothesis_ids)
+            if h in self._hypotheses)
+        excluded: list[dict[str, Any]] = []
+        for hypothesis in self.hypotheses(include_retracted=True):
+            if (hypothesis.effect_id, hypothesis.relation) in chosen_slots \
+                    and hypothesis.hypothesis_id not in hyp_set.hypothesis_ids:
+                entry = hypothesis.as_dict()
+                entry["exclusion_reason"] = reasons.get(
+                    hypothesis.hypothesis_id,
+                    f"not selected in hypothesis set {set_id!r}")
+                excluded.append(entry)
+        self._saved_groups[group_id] = SavedGroup(
+            group_id=group_id, set_id=set_id, note=note,
+            created_at=time.time(), selected=selected,
+            excluded=tuple(excluded))
+        return group_id
+
+    def saved_groups(self) -> list[SavedGroup]:
+        return [self._saved_groups[k] for k in sorted(self._saved_groups)]
+
+    def reopen_group(self, group_id: str) -> SavedGroup:
+        """Reopen one saved group exactly as archived, independently of
+        the live store and of any other saved group."""
+        try:
+            return self._saved_groups[str(group_id)]
+        except KeyError:
+            raise KeyError(f"unknown saved group: {group_id!r}") from None
+
+    def activate_saved_group(
+        self, group_id: str, set_id: str | None = None,
+        activate: bool = False,
+    ) -> HypothesisSet:
+        """Re-create a working set from an archived group's selection.
+
+        Candidates that no longer have live evidence are skipped, but the
+        archive itself is left untouched.
+        """
+        group = self.reopen_group(group_id)
+        live_ids = [entry["hypothesis_id"] for entry in group.selected
+                    if entry["hypothesis_id"] in self._hypotheses]
+        new_set_id = set_id or f"{group.group_id}-reopened"
+        return self.create_hypothesis_set(
+            new_set_id, live_ids,
+            description=f"reopened from saved group {group.group_id!r}",
+            activate=activate)
+
     def _selected_edges(self, set_id: str | None
                         ) -> tuple[dict[tuple[str, str, str], Edge], bool]:
         """Edges visible under a working set.
@@ -721,6 +1038,22 @@ class InvestigationStore:
 
     # ---------------------------------------------------------------- tracing
 
+    def _edge_valid_at(self, edge: Edge, at: float | None) -> bool:
+        """Whether any claim behind an edge holds at moment ``at``.
+
+        Source-record claims are timeless; only time-bounded manual
+        judgments can be excluded by the observation moment.
+        """
+        if at is None:
+            return True
+        for claim in edge.claims:
+            if claim.source_id != MANUAL_SOURCE:
+                return True
+            link = self._manual_links.get(claim.record_id)
+            if link is not None and link.applies_at(at):
+                return True
+        return False
+
     def trace(
         self, seed: str, max_depth: int | None = None,
         *,
@@ -728,6 +1061,7 @@ class InvestigationStore:
         use_set: bool | None = None,
         save: bool = False,
         refresh: bool = False,
+        at: float | None = None,
     ) -> TraceResult:
         """Walk explicit causal links in both directions from one event.
 
@@ -738,6 +1072,10 @@ class InvestigationStore:
         ``save=True`` caches the investigation path; after source/manual
         changes only paths whose evidence changed are invalidated, so a
         repeat call recomputes merely the affected investigation paths.
+
+        ``at`` observes the graph at one moment: time-bounded manual
+        judgments outside their window do not apply then, so the same
+        object can show different relations in different phases.
         """
         if set_id == "__active__":
             set_id = self.active_set
@@ -748,13 +1086,16 @@ class InvestigationStore:
             raise KeyError(f"unknown event or alias: {seed!r}")
         origin_id = origin.event_id
         depth_key = max_depth
-        cache_key = (origin_id, set_id, depth_key)
+        cache_key = (origin_id, set_id, depth_key, at)
         if (not refresh) and (save or cache_key in self._paths):
             state = self._paths.get(cache_key)
             if state is not None and state.valid:
                 return state.result
 
         edge_view, _ = self._selected_edges(set_id)
+        if at is not None:
+            edge_view = {key: edge for key, edge in edge_view.items()
+                         if self._edge_valid_at(edge, at)}
         out_adj: dict[str, list[Edge]] = defaultdict(list)
         in_adj: dict[str, list[Edge]] = defaultdict(list)
         for edge in edge_view.values():
@@ -810,12 +1151,14 @@ class InvestigationStore:
             self._paths[cache_key] = PathState(
                 seed=origin_id, set_id=set_id, max_depth=depth_key,
                 result=result, reached=frozenset(reached),
-                anchors=frozenset(anchors))
+                anchors=frozenset(anchors), at=at)
         return result
 
     def saved_paths(self) -> list[PathState]:
-        return [self._paths[k] for k in sorted(self._paths,
-                                               key=lambda item: (item[0], item[1] or "", item[2] or -1))]
+        return [self._paths[k] for k in sorted(
+            self._paths,
+            key=lambda item: (item[0], item[1] or "", item[2] or -1,
+                              item[3] if item[3] is not None else -1))]
 
     def stale_paths(self) -> list[PathState]:
         return [state for state in self.saved_paths() if not state.valid]
@@ -824,7 +1167,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 3,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -848,6 +1191,8 @@ class InvestigationStore:
                     "scopes": list(link.scopes),
                     "retracts": [r.as_dict() for r in link.retracts],
                     "created_at": link.created_at,
+                    "valid_from": link.valid_from,
+                    "valid_to": link.valid_to,
                 }
                 for link in self.manual_links()
             ],
@@ -861,8 +1206,16 @@ class InvestigationStore:
             "active_set": self.active_set,
             "saved_paths": [
                 {"seed": state.seed, "set_id": state.set_id,
-                 "max_depth": state.max_depth, "valid": state.valid}
+                 "max_depth": state.max_depth, "valid": state.valid,
+                 "at": state.at}
                 for state in self.saved_paths()
+            ],
+            "saved_groups": [
+                {"group_id": group.group_id, "set_id": group.set_id,
+                 "note": group.note, "created_at": group.created_at,
+                 "selected": list(group.selected),
+                 "excluded": list(group.excluded)}
+                for group in self.saved_groups()
             ],
         }
 
@@ -875,7 +1228,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2):
+        if data.get("version") not in (1, 2, 3):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -897,6 +1250,8 @@ class InvestigationStore:
                 retracts=tuple(RecordRef(r["source_id"], r["record_id"])
                                for r in link.get("retracts", ())),
                 created_at=link.get("created_at"),
+                valid_from=link.get("valid_from"),
+                valid_to=link.get("valid_to"),
             )
             store._manual_links[created.link_id] = created
         store._rebuild()
@@ -912,10 +1267,18 @@ class InvestigationStore:
             try:
                 result = store.trace(item["seed"], item.get("max_depth"),
                                      set_id=item.get("set_id"),
-                                     save=True, refresh=True)
+                                     save=True, refresh=True,
+                                     at=item.get("at"))
             except KeyError:
                 continue
             state = store._paths[(result.origin_id, item.get("set_id"),
-                                  item.get("max_depth"))]
+                                  item.get("max_depth"), item.get("at"))]
             state.valid = item.get("valid", True)
+        for group in data.get("saved_groups", ()):
+            store._saved_groups[group["group_id"]] = SavedGroup(
+                group_id=group["group_id"], set_id=group["set_id"],
+                note=group.get("note", ""),
+                created_at=group.get("created_at"),
+                selected=tuple(group.get("selected", ())),
+                excluded=tuple(group.get("excluded", ())))
         return store

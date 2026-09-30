@@ -98,9 +98,26 @@ class ManualLink:
     scopes: tuple[str, ...] = ("manual",)
     retracts: tuple[RecordRef, ...] = ()
     created_at: float | None = None
+    valid_from: float | None = None
+    valid_to: float | None = None
 
     def claim(self) -> RecordRef:
         return RecordRef(MANUAL_SOURCE, self.link_id)
+
+    def applies_at(self, ts: float | None) -> bool:
+        """Whether this judgment holds at one moment in time.
+
+        A time-bounded judgment is local to its window: it must never be
+        generalized to the object's whole history.  An unknown timestamp
+        cannot be excluded, so the judgment applies.
+        """
+        if ts is None:
+            return True
+        if self.valid_from is not None and ts < self.valid_from:
+            return False
+        if self.valid_to is not None and ts > self.valid_to:
+            return False
+        return True
 
 
 MANUAL_SOURCE = "manual"

@@ -38,8 +38,25 @@
   标记失效（`stale_paths()`），无关路径保持有效。
 - **归档不可覆盖**：`Casebook` 以 append-only 方式保存 finding，冻结当时
   的证据、假设选择与路径。`reopen()` 重开当时的判断；
-  `compare_with_latest()` 在不改动旧归档的前提下，与最新证据下重放同一
-  选择做差异对比（新增/消失的因果跳、未决引用、所选假设是否已失效）。
+   `compare_with_latest()` 在不改动旧归档的前提下，与最新证据下重放同一
+   选择做差异对比（新增/消失的因果跳、未决引用、所选假设是否已失效）。
+
+## 第三轮：假设组路径对比、时间范围判断、独立重开
+
+- **整路径对比假设组**：`compare_set_paths(seed, [set-a, set-b])` 从同一
+  锚点分别沿每组假设走完整条传播路径，给出各组共有与独有的因果跳，
+  而不是只比较一个父子槽位。`explain_set(set_id)` 报告该组解释了哪些
+  事件、与哪些来源冲突（被否决候选的来源），以及仍无法解释的部分
+  （未决引用、组内未做选择的争议槽位）。
+- **带时间范围的人工判断**：`add_manual_link(..., valid_from=, valid_to=)`
+  把判断限定在时间窗内；`trace(..., at=t)` 只采纳在 t 时刻有效的判断，
+  同一对象在不同阶段可以有不同关系。事件时间戳落在窗口外时判断保持
+  不激活（`manual_link_status()`），绝不把局部决定推广到全部历史。
+  `adjust_manual_link_window()` 调整窗口后，只有受影响的路径被标记失效。
+- **假设组独立重开**：`save_group(set_id, reasons=...)` 把一组假设连同
+  所有被排除的候选及排除依据一并冻结（append-only，永不删除）；
+  `reopen_group()` 原样查看归档，`activate_saved_group()` 从归档独立
+  重建工作集，不影响现有假设集与其他调查记录。
 
 ## 记录格式
 
@@ -113,17 +130,48 @@ diff = book.compare_with_latest(finding_id, store)
 book.save("casebook.json")              # append-only，永不覆盖旧判断
 ```
 
+### 假设组对比与时间范围判断
+
+```python
+store.create_hypothesis_set("theory-a", [hyp_a])
+store.create_hypothesis_set("theory-b", [hyp_b])
+
+cmp = store.compare_set_paths("guid:child", ["theory-a", "theory-b"])
+cmp.shared_hops                 # 各组共有的因果跳
+cmp.unique_hops["theory-a"]     # 仅在该组路径上出现的跳
+
+report = store.explain_set("theory-a")
+report.explained_events         # 该组解释到的事件（整条路径）
+report.conflicting_sources      # 被否决候选背后的来源
+report.unresolved_refs          # 仍无法解释的未决引用
+
+link_id = store.add_manual_link(
+    "guid:a", "guid:b", "controls",
+    valid_from=0.0, valid_to=100.0)   # 只在阶段内有效
+store.trace("guid:b", at=50.0)        # t=50 看到 controls
+store.trace("guid:b", at=500.0)       # t=500 不适用该判断
+store.adjust_manual_link_window(link_id, 0.0, 1000.0)  # 只失效相关路径
+
+gid = store.save_group("theory-a",
+                       reasons={hyp_b: "edr-b trust too low"})
+group = store.reopen_group(gid)       # 候选与排除依据原样保留
+store.activate_saved_group(gid, activate=True)  # 独立重开为新工作集
+```
+
 ## 文件
 
 - `investigation/models.py`：事件、来源、边、未决引用、人工关联、假设模型
 - `investigation/store.py`：导入/撤销、身份归并、冲突分组、假设集、
-  按假设追踪、路径增量失效、快照序列化
+  按假设追踪、假设组路径对比与解释报告、时间窗人工判断、
+  路径增量失效、假设组归档、快照序列化
 - `investigation/casebook.py`：append-only 归档、历史重开、最新证据对比
 - `investigation/snapshot.py`：快照读写
 - `tests/test_investigation.py`：乱序、伪相似、重复导入、撤销、跨源归并、
   快照等首轮场景测试
 - `tests/test_hypotheses.py`：冲突父关系/重复 PID/迟到父事件、来源更正、
   人工关联撤销、增量路径失效、归档重开与对比
+- `tests/test_groups.py`：假设组整路径对比、解释报告、时间窗判断、
+  窗口调整的增量失效、假设组独立重开与快照往返
 
 ## 运行测试
 
@@ -131,4 +179,5 @@ book.save("casebook.json")              # append-only，永不覆盖旧判断
 python3 -m pytest tests/ -q
 PYTHONPATH=. python3 examples/demo.py
 PYTHONPATH=. python3 examples/demo_hypotheses.py
+PYTHONPATH=. python3 examples/demo_groups.py
 ```
