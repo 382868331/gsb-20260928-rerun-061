@@ -20,6 +20,14 @@ from .store import (
     PathState,
     TraceResult,
 )
+from .verification import (
+    OutcomePreview,
+    PlannedCheck,
+    PlannedOutcome,
+    VerificationDecision,
+    VerificationMaterial,
+    VerificationPlan,
+)
 
 __all__ = [
     "Event",
@@ -42,4 +50,10 @@ __all__ = [
     "InvestigationStore",
     "TraceResult",
     "InvestigationImportError",
+    "PlannedCheck",
+    "PlannedOutcome",
+    "VerificationPlan",
+    "OutcomePreview",
+    "VerificationMaterial",
+    "VerificationDecision",
 ]

@@ -47,6 +47,17 @@
   的证据、假设选择与路径。`reopen()` 重开当时的判断；
   `compare_with_latest()` 在不改动旧归档的前提下，与最新证据下重放同一
   选择做差异对比（新增/消失的因果跳、未决引用、所选假设是否已失效）。
+- **核查计划不是事实**：`create_verification_plan(...)` 为每项关系列出
+  可能结果，但不会把计划来源导入真实图。每个结果预演会排除哪些假设、
+  保留哪些传播路径、仍无法区分哪些假设组，均保存在计划快照中。
+- **先审查再采纳**：核查材料到达后先进入 staged；与计划不一致、与其他
+  材料矛盾、或复用同一来源/记录时，`surprising_materials()` 优先展示。
+  用户通过 accept/reject 决定采纳范围，重复确认只保留为重复来源声明，
+  不会被算作独立支持。
+- **反事实试算独立**：`study_alternative_outcome(...)` 从当前真实证据
+  克隆一个独立研究分支；该分支中的假设性记录不影响真实调查。
+- **撤回理由可追查**：接受、拒绝、撤回材料及当时对应的排除假设均进入
+  审计记录；后来撤回材料不会删除原先决策和理由。
 
 ## 记录格式
 
@@ -123,17 +134,58 @@ diff = book.compare_with_latest(finding_id, store)
 book.save("casebook.json")              # append-only，永不覆盖旧判断
 ```
 
+### 核查计划、材料审查与反事实试算
+
+```python
+plan = store.create_verification_plan("check-parent", [{
+    "check_id": "parent-1",
+    "effect_id": "guid:child",
+    "relation": "parent",
+    "source_id": "memory-analysis",
+    "record_id": "parent-result",
+    "outcomes": [
+        {"outcome_id": "supports-a", "cause_id": "guid:p-a"},
+        {"outcome_id": "supports-b", "cause_id": "guid:p-b"},
+        {"outcome_id": "no-parent"},
+    ],
+}], seeds=["guid:child"])
+
+for preview in plan.previews:
+    preview.excluded_hypothesis_ids
+    preview.retained_paths
+    preview.indistinguishable_groups
+    preview.shared_source_plan_ids
+    preview.duplicate_check_ids
+
+material_id = store.record_verification_result(
+    "check-parent", "parent-1", new_record,
+    claimed_outcome_id="supports-a")
+store.surprising_materials()             # 矛盾、意外来源、重复信息先展示
+store.accept_verification_materials(
+    [material_id], scope="selected", reason="采纳内存镜像记录")
+store.reject_verification_materials([other_material_id])
+store.retract_accepted_material(material_id, reason="镜像时间窗被更正")
+store.verification_decisions()           # 原排除决定和理由仍可审计
+
+study = store.study_alternative_outcome(
+    "check-parent", "parent-1", "supports-b")
+```
+
 ## 文件
 
 - `investigation/models.py`：事件、来源、边、未决引用、人工关联、假设模型
 - `investigation/store.py`：导入/撤销、身份归并、冲突分组、假设集、
   按假设追踪、路径增量失效、快照序列化
 - `investigation/casebook.py`：append-only 归档、历史重开、最新证据对比
+- `investigation/verification.py`：核查计划、可能结果预览、到达材料、
+  采纳/拒绝/撤回审计模型
 - `investigation/snapshot.py`：快照读写
 - `tests/test_investigation.py`：乱序、伪相似、重复导入、撤销、跨源归并、
   快照等首轮场景测试
 - `tests/test_hypotheses.py`：冲突父关系/重复 PID/迟到父事件、来源更正、
   人工关联撤销、增量路径失效、归档重开与对比
+- `tests/test_verification.py`：计划反事实预览、矛盾材料、重复来源、
+  用户采纳范围、独立研究和快照审计
 
 ## 运行测试
 

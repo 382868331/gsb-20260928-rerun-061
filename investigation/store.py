@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -137,6 +138,9 @@ class InvestigationStore:
         self.active_set: str | None = None
         # Saved investigation paths, invalidated incrementally on change.
         self._paths: dict[tuple[str, str | None, int | None], PathState] = {}
+        self._verification_plans: dict[str, Any] = {}
+        self._verification_materials: dict[str, Any] = {}
+        self._verification_decisions: list[Any] = []
 
     # ---------------------------------------------------------------- import
 
@@ -848,6 +852,477 @@ class InvestigationStore:
                     self._retractions.items(),
                     key=lambda kv: (kv[0].source_id, kv[0].record_id))}
 
+    # ------------------------------------------------------ verification plans
+
+    def create_verification_plan(
+        self, plan_id: str, checks: Iterable[Any], *,
+        seeds: Iterable[str] | None = None,
+        description: str = "",
+        set_id: str | None = "__active__",
+        max_depth: int | None = None,
+        at_time: float | None = None,
+    ) -> Any:
+        from .verification import (
+            OutcomePreview, PlannedCheck, VerificationPlan,
+        )
+
+        if not plan_id or not isinstance(plan_id, str):
+            raise ImportError("plan_id must be a non-empty string")
+        if plan_id in self._verification_plans:
+            raise ImportError(f"verification plan {plan_id!r} already exists")
+        if set_id == "__active__":
+            set_id = self.active_set
+        if set_id is not None and set_id not in self._hyp_sets:
+            raise KeyError(f"unknown hypothesis set: {set_id!r}")
+
+        normalized_checks: list[PlannedCheck] = []
+        source_uses: dict[tuple[str, str], list[str]] = defaultdict(list)
+        seen_checks: set[str] = set()
+        for raw_check in checks:
+            check = (raw_check if isinstance(raw_check, PlannedCheck)
+                     else PlannedCheck.from_dict(raw_check))
+            if check.check_id in seen_checks:
+                raise ImportError(f"duplicate planned check {check.check_id!r}")
+            seen_checks.add(check.check_id)
+            if not check.outcomes:
+                raise ImportError(
+                    f"planned check {check.check_id!r} must list possible outcomes")
+            if self.get_event(check.effect_id) is None:
+                raise KeyError(f"unknown planned effect: {check.effect_id!r}")
+            effect_id = self.get_event(check.effect_id).event_id
+            outcome_ids = set()
+            for outcome in check.outcomes:
+                if outcome.outcome_id in outcome_ids:
+                    raise ImportError(
+                        f"duplicate outcome {outcome.outcome_id!r} in "
+                        f"check {check.check_id!r}")
+                outcome_ids.add(outcome.outcome_id)
+                if outcome.cause_id is not None and self.get_event(outcome.cause_id) is None:
+                    raise KeyError(f"unknown planned cause: {outcome.cause_id!r}")
+                for claim in outcome.retracts:
+                    if claim not in self._claim_meta:
+                        raise KeyError(f"unknown planned retraction claim: {claim}")
+            normalized_checks.append(PlannedCheck(
+                check_id=check.check_id, effect_id=effect_id,
+                relation=check.relation, source_id=check.source_id,
+                record_id=check.record_id, outcomes=check.outcomes,
+                note=check.note))
+            source_uses[(check.source_id, check.record_id)].append(check.check_id)
+
+        if seeds is None:
+            seed_ids = sorted({check.effect_id for check in normalized_checks})
+        else:
+            seed_ids = []
+            for seed in seeds:
+                event = self.get_event(str(seed))
+                if event is None:
+                    raise KeyError(f"unknown planned trace seed: {seed!r}")
+                seed_ids.append(event.event_id)
+
+        plan = VerificationPlan(
+            plan_id=plan_id, checks=tuple(normalized_checks),
+            seeds=tuple(seed_ids), baseline_set_id=set_id,
+            description=description, created_at=time.time(),
+            hypothesis_snapshot=tuple(self.hypotheses(include_retracted=True,
+                                                      at_time=at_time)))
+        previews: list[OutcomePreview] = []
+        for check in plan.checks:
+            repeated_checks = sorted(cid for cid in source_uses[(check.source_id, check.record_id)]
+                                     if cid != check.check_id)
+            shared_plans = sorted(
+                other.plan_id for other in self._verification_plans.values()
+                for other_check in other.checks
+                if other_check.source_id == check.source_id
+                and other.plan_id != plan_id)
+            for outcome in check.outcomes:
+                preview = self._preview_planned_outcome(
+                    plan, check, outcome, seed_ids, set_id,
+                    max_depth=max_depth, at_time=at_time)
+                preview.shared_source_plan_ids = tuple(dict.fromkeys(
+                    tuple(preview.shared_source_plan_ids) + tuple(shared_plans)))
+                if repeated_checks:
+                    preview.duplicate_check_ids = tuple(repeated_checks)
+                previews.append(preview)
+        plan.previews = tuple(previews)
+        self._verification_plans[plan_id] = plan
+        return plan
+
+    def verification_plans(self) -> list[Any]:
+        return [self._verification_plans[key]
+                for key in sorted(self._verification_plans)]
+
+    def verification_plan(self, plan_id: str) -> Any:
+        return self._verification_plans[plan_id]
+
+    def _preview_planned_outcome(
+        self, plan: Any, check: Any, outcome: Any, seeds: list[str],
+        set_id: str | None, *, max_depth: int | None,
+        at_time: float | None,
+    ) -> Any:
+        from .verification import OutcomePreview
+
+        clone = InvestigationStore.restore(deepcopy(self.snapshot()))
+        clone.active_set = set_id
+        record = self._planned_record(check, outcome)
+        existing = clone._records.get(check.source_id, {})
+        clone.import_source(
+            check.source_id, [*existing.values(), record],
+            description=clone._sources.get(check.source_id, Source("")).description,
+            trust=(clone._sources[check.source_id].trust
+                   if check.source_id in clone._sources else None),
+            scopes=(clone._sources[check.source_id].scopes
+                    if check.source_id in clone._sources else ()))
+        supported = self._matching_hypothesis_ids(
+            clone, check.effect_id, check.relation, outcome, at_time)
+        slot_ids = {
+            h.hypothesis_id for h in clone.hypotheses(at_time=at_time)
+            if h.effect_id == check.effect_id and h.relation == check.relation
+            and self._windows_overlap_at(h, None, at_time)
+        }
+        retracted_ids = set()
+        for hypothesis in clone.hypotheses(include_retracted=True, at_time=at_time):
+            if outcome.retracts and any(claim in outcome.retracts
+                                        for claim in hypothesis.claims):
+                retracted_ids.add(hypothesis.hypothesis_id)
+        excluded = tuple(sorted((slot_ids | retracted_ids) - set(supported)))
+        trial_set_id = self._create_preview_set(
+            clone, plan.plan_id, check.check_id, outcome.outcome_id,
+            set_id, supported, excluded, at_time=at_time)
+        paths = tuple(clone.trace(seed, max_depth, set_id=trial_set_id,
+                                  at_time=at_time)
+                      for seed in seeds)
+        excluded_set = set(excluded)
+        remaining_slots: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for hypothesis in clone.hypotheses(at_time=at_time):
+            if hypothesis.hypothesis_id not in excluded_set:
+                remaining_slots[(hypothesis.effect_id,
+                                 hypothesis.relation)].append(hypothesis.hypothesis_id)
+        groups = [tuple(sorted(ids)) for ids in remaining_slots.values()
+                  if len(ids) > 1]
+        return OutcomePreview(
+            plan_id=plan.plan_id, check_id=check.check_id,
+            outcome_id=outcome.outcome_id,
+            supported_hypothesis_ids=tuple(sorted(supported)),
+            excluded_hypothesis_ids=excluded,
+            retained_paths=paths,
+            indistinguishable_groups=tuple(groups),
+            evidence_claim=RecordRef(check.source_id, check.record_id))
+
+    def _planned_record(self, check: Any, outcome: Any) -> dict[str, Any]:
+        event = self.get_event(check.effect_id)
+        record = {
+            "record_id": check.record_id,
+            "kind": event.kind.value,
+            "ts": event.ts,
+            "aliases": list(event.aliases),
+            "refs": [],
+        }
+        if outcome.cause_id is not None:
+            cause = self.get_event(outcome.cause_id)
+            record["refs"].append({
+                "relation": check.relation,
+                "target": cause.event_id,
+                "direction": "incoming",
+            })
+        if outcome.retracts:
+            record["retracts"] = [claim.as_dict() for claim in outcome.retracts]
+        return record
+
+    def _matching_hypothesis_ids(self, store: "InvestigationStore", effect_id: str,
+                                 relation: str, outcome: Any,
+                                 at_time: float | None) -> set[str]:
+        if outcome.cause_id is None:
+            return set()
+        cause = store.get_event(outcome.cause_id)
+        cause_id = cause.event_id if cause is not None else None
+        matched = set()
+        for hypothesis in store.hypotheses(at_time=at_time):
+            if (hypothesis.effect_id == effect_id
+                    and hypothesis.relation == relation
+                    and hypothesis.cause_id == cause_id):
+                matched.add(hypothesis.hypothesis_id)
+        return matched
+
+    @staticmethod
+    def _windows_overlap_at(hypothesis: Hypothesis, _: Any,
+                            at_time: float | None) -> bool:
+        return hypothesis.active_at(at_time)
+
+    def _create_preview_set(self, clone: "InvestigationStore", plan_id: str,
+                            check_id: str, outcome_id: str,
+                            baseline_set_id: str | None, supported: set[str],
+                            excluded: tuple[str, ...], *,
+                            at_time: float | None) -> str:
+        selected = set(supported)
+        if baseline_set_id is not None:
+            selected |= set(clone._hyp_sets[baseline_set_id].hypothesis_ids)
+        else:
+            excluded_by_slot: dict[tuple[str, str], set[str]] = defaultdict(set)
+            for hid in excluded:
+                hypothesis = clone._hypotheses.get(hid)
+                if hypothesis is not None:
+                    excluded_by_slot[(hypothesis.effect_id,
+                                      hypothesis.relation)].add(hid)
+            for hypothesis in clone.hypotheses(at_time=at_time):
+                slot = (hypothesis.effect_id, hypothesis.relation)
+                if slot not in excluded_by_slot or hypothesis.hypothesis_id in selected:
+                    selected.add(hypothesis.hypothesis_id)
+        selected = {hid for hid in selected
+                    if hid in clone._hypotheses
+                    and not clone._hypotheses[hid].is_retracted
+                    and hid not in excluded}
+        set_id = f"trial:{plan_id}:{check_id}:{outcome_id}"
+        clone.create_hypothesis_set(
+            set_id, selected,
+            description=f"counterfactual preview for {outcome_id}",
+            activate=False)
+        return set_id
+
+    def study_alternative_outcome(self, plan_id: str, check_id: str,
+                                  outcome_id: str) -> "InvestigationStore":
+        plan = self.verification_plan(plan_id)
+        check = next(c for c in plan.checks if c.check_id == check_id)
+        outcome = next(o for o in check.outcomes if o.outcome_id == outcome_id)
+        preview = next(p for p in plan.previews
+                       if p.check_id == check_id and p.outcome_id == outcome_id)
+        clone = InvestigationStore.restore(deepcopy(self.snapshot()))
+        record = self._planned_record(check, outcome)
+        existing = clone._records.get(check.source_id, {})
+        clone.import_source(check.source_id, [*existing.values(), record])
+        self._create_preview_set(
+            clone, plan.plan_id, check.check_id, outcome_id,
+            plan.baseline_set_id, set(preview.supported_hypothesis_ids),
+            preview.excluded_hypothesis_ids, at_time=None)
+        clone.activate_set(f"trial:{plan_id}:{check_id}:{outcome_id}")
+        return clone
+
+    @staticmethod
+    def _merge_source_records(source_id: str, incoming: list[dict[str, Any]],
+                              existing: dict[str, dict[str, Any]]
+                              ) -> dict[str, dict[str, Any]]:
+        merged = deepcopy(existing)
+        for record in incoming:
+            record_id = str(record["record_id"])
+            if record_id in merged:
+                merged[record_id] = deepcopy(record)
+            else:
+                merged[record_id] = deepcopy(record)
+        return merged
+
+    # ---------------------------------------------------- received materials
+
+    def record_verification_result(
+        self, plan_id: str, check_id: str, record: dict[str, Any], *,
+        claimed_outcome_id: str | None = None,
+        material_id: str | None = None,
+    ) -> str:
+        from .verification import VerificationMaterial
+
+        plan = self.verification_plan(plan_id)
+        check = next((c for c in plan.checks if c.check_id == check_id), None)
+        if check is None:
+            raise KeyError(f"unknown planned check {check_id!r} in {plan_id!r}")
+        record = dict(record)
+        record_id = str(record.get("record_id", check.record_id))
+        record["record_id"] = record_id
+        source_id = str(record.get("source_id", check.source_id))
+        record.pop("source_id", None)
+        material_id = material_id or f"material-{len(self._verification_materials) + 1}"
+        if material_id in self._verification_materials:
+            raise ImportError(f"verification material {material_id!r} already exists")
+        if claimed_outcome_id is not None and not any(
+                o.outcome_id == claimed_outcome_id for o in check.outcomes):
+            raise KeyError(f"outcome {claimed_outcome_id!r} was not planned")
+        contradictions = self._material_contradictions(
+            check, claimed_outcome_id, source_id, record_id, record)
+        duplicates = tuple(
+            other.material_id for other in self._verification_materials.values()
+            if other.source_id == source_id and other.record_id == record_id
+            and other.status in {"staged", "accepted"})
+        shared_plans = tuple(dict.fromkeys(
+            other.plan_id for other in self._verification_materials.values()
+            if other.source_id == source_id
+            and other.plan_id != plan_id
+            and other.status in {"staged", "accepted"}))
+        material = VerificationMaterial(
+            material_id=material_id, plan_id=plan_id, check_id=check_id,
+            claimed_outcome_id=claimed_outcome_id, source_id=source_id,
+            record_id=record_id, record=record,
+            contradictions=tuple(contradictions),
+            duplicate_material_ids=duplicates,
+            shared_source_plan_ids=shared_plans,
+            received_at=time.time())
+        self._verification_materials[material_id] = material
+        return material_id
+
+    def _material_contradictions(self, check: Any, claimed_outcome_id: str | None,
+                                 source_id: str, record_id: str,
+                                 record: dict[str, Any]) -> list[str]:
+        contradictions = []
+        if claimed_outcome_id is None:
+            contradictions.append("unplanned_outcome")
+        if (source_id, record_id) != (check.source_id, check.record_id):
+            contradictions.append("source_or_record_differs_from_plan")
+        observed_cause = self._record_relation_cause(
+            record, check.effect_id, check.relation)
+        if claimed_outcome_id is not None:
+            outcome = next(o for o in check.outcomes
+                           if o.outcome_id == claimed_outcome_id)
+            expected = None if outcome.cause_id is None else self.get_event(outcome.cause_id)
+            expected_id = expected.event_id if expected is not None else None
+            if observed_cause != expected_id:
+                contradictions.append("observed_relation_differs_from_claimed_outcome")
+            expected_retractions = {(r.source_id, r.record_id)
+                                    for r in outcome.retracts}
+            actual_retractions = {
+                (str(r.get("source_id", check.source_id)),
+                 str(r.get("record_id", r.get("target"))))
+                if isinstance(r, dict) else (check.source_id, str(r))
+                for r in record.get("retracts", ())}
+            if actual_retractions != expected_retractions:
+                contradictions.append("retractions_differ_from_claimed_outcome")
+        for other in self._verification_materials.values():
+            other_check = self._find_check(other.plan_id, other.check_id)
+            other_cause = self._record_relation_cause(
+                other.record, other_check.effect_id, other_check.relation)
+            if (other_check.effect_id == check.effect_id
+                    and other_check.relation == check.relation
+                    and other.status in {"staged", "accepted"}
+                    and other_cause != observed_cause):
+                contradictions.append(f"contradicts_material:{other.material_id}")
+        return contradictions
+
+    def _find_check(self, plan_id: str, check_id: str) -> Any:
+        plan = self.verification_plan(plan_id)
+        return next(c for c in plan.checks if c.check_id == check_id)
+
+    def _record_relation_cause(self, record: dict[str, Any], effect_id: str,
+                               relation: str) -> str | None:
+        effect = self.get_event(effect_id)
+        aliases = set(effect.aliases) if effect is not None else {effect_id}
+        for ref in record.get("refs", ()):
+            if ref.get("relation") != relation:
+                continue
+            target = self.get_event(str(ref.get("target", "")))
+            if ref.get("direction", "incoming") == "incoming":
+                return target.event_id if target is not None else str(ref.get("target"))
+            event_aliases = set(record.get("aliases", ())) | {str(record.get("event_id", ""))}
+            if event_aliases & aliases:
+                return target.event_id if target is not None else str(ref.get("target"))
+        return None
+
+    def verification_materials(self, *, only_surprising: bool = False) -> list[Any]:
+        items = [self._verification_materials[k]
+                 for k in sorted(self._verification_materials)]
+        if only_surprising:
+            return [item for item in items if item.contradictions
+                    or item.duplicate_material_ids or item.shared_source_plan_ids]
+        return items
+
+    def surprising_materials(self) -> list[Any]:
+        return self.verification_materials(only_surprising=True)
+
+    def accept_verification_materials(
+        self, material_ids: Iterable[str], *,
+        scope: str = "selected", reason: str = "",
+    ) -> list[Any]:
+        from .verification import VerificationDecision
+
+        ids = [str(material_id) for material_id in material_ids]
+        grouped: dict[str, list[Any]] = defaultdict(list)
+        decisions = []
+        for material_id in ids:
+            material = self._verification_materials[material_id]
+            if material.status != "staged":
+                raise ImportError(f"material {material_id!r} is {material.status}")
+            grouped[material.source_id].append(material)
+        for source_id, source_materials in grouped.items():
+            by_record = {m.record_id: deepcopy(m.record) for m in source_materials}
+            if scope == "planned":
+                records_to_import = list(by_record.values())
+            elif scope == "selected":
+                existing = deepcopy(self._records.get(source_id, {}))
+                existing.update(by_record)
+                records_to_import = list(existing.values())
+            else:
+                raise ImportError("scope must be 'selected' or 'planned'")
+            source = self._sources.get(source_id)
+            self.import_source(
+                source_id, records_to_import,
+                description=source.description if source else "",
+                trust=source.trust if source else None,
+                scopes=source.scopes if source else ())
+        for material_id in ids:
+            material = self._verification_materials[material_id]
+            check = self._find_check(material.plan_id, material.check_id)
+            outcome = next((o for o in check.outcomes
+                            if o.outcome_id == material.claimed_outcome_id), None)
+            preview = next((p for p in self.verification_plan(material.plan_id).previews
+                            if p.check_id == material.check_id
+                            and p.outcome_id == material.claimed_outcome_id), None)
+            excluded = (preview.excluded_hypothesis_ids
+                        if preview is not None and not material.contradictions else ())
+            material.status = "accepted"
+            decision = VerificationDecision(
+                material_id=material.material_id, action="accepted",
+                recorded_at=time.time(), plan_id=material.plan_id,
+                check_id=material.check_id,
+                outcome_id=material.claimed_outcome_id,
+                claim=material.claim, reason=reason,
+                excluded_hypothesis_ids=excluded)
+            self._verification_decisions.append(decision)
+            decisions.append(decision)
+        return decisions
+
+    def reject_verification_materials(self, material_ids: Iterable[str], *,
+                                      reason: str = "") -> list[Any]:
+        from .verification import VerificationDecision
+
+        decisions = []
+        for material_id in material_ids:
+            material = self._verification_materials[str(material_id)]
+            if material.status != "staged":
+                raise ImportError(f"material {material_id!r} is {material.status}")
+            material.status = "rejected"
+            decision = VerificationDecision(
+                material_id=material.material_id, action="rejected",
+                recorded_at=time.time(), plan_id=material.plan_id,
+                check_id=material.check_id,
+                outcome_id=material.claimed_outcome_id, claim=None,
+                reason=reason)
+            self._verification_decisions.append(decision)
+            decisions.append(decision)
+        return decisions
+
+    def retract_accepted_material(self, material_id: str, *,
+                                  reason: str = "") -> bool:
+        from .verification import VerificationDecision
+
+        material = self._verification_materials.get(str(material_id))
+        if material is None or material.status != "accepted":
+            return False
+        material.status = "retracted"
+        source_batch = deepcopy(self._records.get(material.source_id, {}))
+        source_batch.pop(material.record_id, None)
+        source = self._sources.get(material.source_id)
+        if source_batch:
+            self.import_source(
+                material.source_id, list(source_batch.values()),
+                description=source.description if source else "",
+                trust=source.trust if source else None,
+                scopes=source.scopes if source else ())
+        else:
+            self.revoke_source(material.source_id)
+        self._verification_decisions.append(VerificationDecision(
+            material_id=material.material_id, action="retracted",
+            recorded_at=time.time(), plan_id=material.plan_id,
+            check_id=material.check_id, outcome_id=material.claimed_outcome_id,
+            claim=material.claim, reason=reason))
+        return True
+
+    def verification_decisions(self) -> list[Any]:
+        return list(self._verification_decisions)
+
     # -------------------------------------------------------- working sets
 
     def create_hypothesis_set(
@@ -1178,6 +1653,14 @@ class InvestigationStore:
                 for judgment in self._manual_judgments
             ],
             "hypothesis_ledger": [h.as_dict() for h in self._hypothesis_ledger.values()],
+            "verification_plans": [plan.as_dict()
+                                   for plan in self.verification_plans()],
+            "verification_materials": [
+                material.as_dict()
+                for material in self.verification_materials()],
+            "verification_decisions": [
+                decision.as_dict()
+                for decision in self.verification_decisions()],
         }
 
     @staticmethod
@@ -1295,4 +1778,86 @@ class InvestigationStore:
                 store._manual_judgments.append(ManualJudgment(
                     link_id=link.link_id, action="created", link=link,
                     recorded_at=link.created_at))
+        store._restore_verification(data)
         return store
+
+    def _restore_verification(self, data: dict[str, Any]) -> None:
+        from .verification import (
+            OutcomePreview, PlannedCheck, PlannedOutcome, VerificationDecision,
+            VerificationMaterial, VerificationPlan,
+        )
+
+        for item in data.get("verification_plans", ()):
+            checks = tuple(PlannedCheck.from_dict(check)
+                           for check in item.get("checks", ()))
+            previews = []
+            for preview in item.get("previews", ()):
+                previews.append(OutcomePreview(
+                    plan_id=preview["plan_id"],
+                    check_id=preview["check_id"],
+                    outcome_id=preview["outcome_id"],
+                    supported_hypothesis_ids=tuple(preview.get("supported_hypothesis_ids", ())),
+                    excluded_hypothesis_ids=tuple(preview.get("excluded_hypothesis_ids", ())),
+                    retained_paths=tuple(
+                        _preview_trace_from_dict(path)
+                        for path in preview.get("retained_paths", ())),
+                    indistinguishable_groups=tuple(
+                        tuple(group) for group in preview.get("indistinguishable_groups", ())),
+                    evidence_claim=(RecordRef(preview["evidence_claim"]["source_id"],
+                                              preview["evidence_claim"]["record_id"])
+                                    if preview.get("evidence_claim") else None),
+                    shared_source_plan_ids=tuple(preview.get("shared_source_plan_ids", ())),
+                    duplicate_check_ids=tuple(preview.get("duplicate_check_ids", ())),
+                ))
+            self._verification_plans[item["plan_id"]] = VerificationPlan(
+                plan_id=item["plan_id"], checks=checks,
+                seeds=tuple(item.get("seeds", ())),
+                baseline_set_id=item.get("baseline_set_id"),
+                description=item.get("description", ""),
+                created_at=item.get("created_at"),
+                hypothesis_snapshot=tuple(
+                    Hypothesis(
+                        hypothesis_id=h["hypothesis_id"], effect_id=h["effect_id"],
+                        relation=h["relation"], cause_id=h["cause_id"],
+                        claims=frozenset(RecordRef(c["source_id"], c["record_id"])
+                                         for c in h.get("claims", ())),
+                        retracted_claims=frozenset(
+                            RecordRef(c["source_id"], c["record_id"])
+                            for c in h.get("retracted_claims", ())),
+                        scopes=frozenset(h.get("scopes", ())),
+                        confidence=h.get("confidence", 0.5),
+                        origins=frozenset(h.get("origins", ())),
+                        valid_start=h.get("valid_start"),
+                        valid_end=h.get("valid_end"))
+                    for h in item.get("hypothesis_snapshot", ())),
+                previews=tuple(previews))
+        for item in data.get("verification_materials", ()):
+            material = VerificationMaterial.from_dict(item)
+            self._verification_materials[material.material_id] = material
+        for item in data.get("verification_decisions", ()):
+            self._verification_decisions.append(
+                VerificationDecision.from_dict(item))
+
+
+def _preview_trace_from_dict(data: dict[str, Any]) -> TraceResult:
+    from .models import PendingRef
+
+    def hops(items):
+        return [EdgeHop(
+            cause_id=item["cause_id"], effect_id=item["effect_id"],
+            relation=item["relation"],
+            claims=tuple(RecordRef(claim["source_id"], claim["record_id"])
+                         for claim in item.get("claims", ())))
+            for item in items]
+
+    return TraceResult(
+        origin_id=data["origin_id"],
+        upstream=hops(data.get("upstream", ())),
+        downstream=hops(data.get("downstream", ())),
+        events={},
+        unresolved=[PendingRef(
+            claimant_id=item["claimant_id"], relation=item["relation"],
+            direction=item["direction"], target=item["target"],
+            claim=RecordRef(item["claim"]["source_id"],
+                            item["claim"]["record_id"]))
+            for item in data.get("unresolved", ())])
