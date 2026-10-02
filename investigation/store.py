@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -11,10 +12,14 @@ from .models import (
     Event,
     EventKind,
     Hypothesis,
+    EvidenceDecision,
     ManualLink,
+    PlannedCheck,
     PendingRef,
+    ReceivedBatch,
     RecordRef,
     Source,
+    VerificationPlan,
 )
 
 
@@ -105,6 +110,18 @@ class PathState:
     valid: bool = True
 
 
+@dataclass(frozen=True)
+class OutcomeAssessment:
+    outcome_id: str
+    label: str
+    excluded_hypothesis_ids: tuple[str, ...]
+    retained_hypothesis_ids: tuple[str, ...]
+    supported_hypothesis_ids: tuple[str, ...]
+    indistinguishable_groups: tuple[tuple[str, ...], ...]
+    retained_paths: dict[str, TraceResult]
+    prospective: bool = True
+
+
 class InvestigationStore:
     """In-memory evidence graph, rebuilt deterministically from raw records.
 
@@ -137,6 +154,9 @@ class InvestigationStore:
         self.active_set: str | None = None
         # Saved investigation paths, invalidated incrementally on change.
         self._paths: dict[tuple[str, str | None, int | None], PathState] = {}
+        self._verification_plans: dict[str, VerificationPlan] = {}
+        self._received_batches: dict[str, ReceivedBatch] = {}
+        self._evidence_decisions: list[EvidenceDecision] = []
 
     # ---------------------------------------------------------------- import
 
@@ -848,6 +868,451 @@ class InvestigationStore:
                     self._retractions.items(),
                     key=lambda kv: (kv[0].source_id, kv[0].record_id))}
 
+    # ------------------------------------------------- verification planning
+
+    def create_verification_plan(
+        self, plan_id: str, checks: Iterable[PlannedCheck | dict[str, Any]],
+        *,
+        seeds: Iterable[str] = (),
+        set_id: str | None = "__active__",
+        description: str = "",
+    ) -> VerificationPlan:
+        if not plan_id or not isinstance(plan_id, str):
+            raise ImportError("plan_id must be a non-empty string")
+        if plan_id in self._verification_plans:
+            raise ImportError(f"verification plan {plan_id!r} already exists")
+        normalized_checks = tuple(
+            check if isinstance(check, PlannedCheck)
+            else self._planned_check_from_dict(check)
+            for check in checks)
+        if not normalized_checks:
+            raise ImportError("a verification plan requires at least one check")
+        self._validate_planned_checks(normalized_checks)
+        if set_id == "__active__":
+            set_id = self.active_set
+        if set_id is not None and set_id not in self._hyp_sets:
+            raise KeyError(f"unknown hypothesis set: {set_id!r}")
+        seed_list = [str(seed) for seed in seeds]
+        plan = VerificationPlan(
+            plan_id=plan_id,
+            checks=normalized_checks,
+            created_at=time.time(),
+            set_id=set_id,
+            hypothesis_ids=frozenset(self._hypotheses),
+            seeds=tuple(seed_list),
+            description=description,
+            baseline_snapshot=copy.deepcopy(self.snapshot()),
+        )
+        self._verification_plans[plan_id] = plan
+        return plan
+
+    @staticmethod
+    def _validate_planned_checks(checks: tuple[PlannedCheck, ...]) -> None:
+        check_ids = [check.check_id for check in checks]
+        if len(check_ids) != len(set(check_ids)):
+            raise ImportError("check_id values must be unique within a plan")
+        for check in checks:
+            outcome_ids = [outcome.outcome_id for outcome in check.outcomes]
+            if not check.outcomes:
+                raise ImportError(
+                    f"check {check.check_id!r} requires possible outcomes")
+            if len(outcome_ids) != len(set(outcome_ids)):
+                raise ImportError(
+                    f"outcome ids in check {check.check_id!r} must be unique")
+
+    @staticmethod
+    def _planned_check_from_dict(data: dict[str, Any]) -> PlannedCheck:
+        from .models import PlannedOutcome
+
+        return PlannedCheck(
+            check_id=str(data["check_id"]),
+            label=str(data.get("label", data["check_id"])),
+            source_id=str(data["source_id"]),
+            relation=str(data["relation"]),
+            target=data.get("target"),
+            direction=str(data.get("direction", "incoming")),
+            outcomes=tuple(
+                PlannedOutcome(
+                    outcome_id=str(item["outcome_id"]),
+                    label=str(item.get("label", item["outcome_id"])),
+                    records=tuple(dict(record)
+                                  for record in item.get("records", ())),
+                    note=str(item.get("note", "")),
+                )
+                for item in data.get("outcomes", ())),
+        )
+
+    def verification_plans(self) -> list[VerificationPlan]:
+        return [self._verification_plans[key]
+                for key in sorted(self._verification_plans)]
+
+    def verification_plan(self, plan_id: str) -> VerificationPlan:
+        return self._verification_plans[plan_id]
+
+    def assess_plan_outcome(self, plan_id: str, check_id: str,
+                            outcome_id: str) -> OutcomeAssessment:
+        plan = self.verification_plan(plan_id)
+        check = self._find_planned_check(plan, check_id)
+        outcome = self._find_planned_outcome(check, outcome_id)
+        trial = self._open_planned_outcome(plan, check, outcome)
+        baseline_ids = set(plan.hypothesis_ids)
+        after = {h.hypothesis_id: h for h in trial.hypotheses(True)}
+        retained = tuple(sorted(
+            hid for hid in baseline_ids
+            if hid in after and not after[hid].is_retracted))
+        excluded = tuple(sorted(baseline_ids - set(retained)))
+        before = {hid: self._hypotheses[hid] for hid in baseline_ids
+                  if hid in self._hypotheses}
+        supported = tuple(sorted(
+            hid for hid, hypothesis in after.items()
+            if not hypothesis.is_retracted and self._outcome_supports(
+                plan, check, outcome, hypothesis, before.get(hid))))
+        groups = self._indistinguishable_groups(
+            [after[hid] for hid in retained])
+        seeds = plan.seeds or tuple(sorted({
+            self._hypotheses[hid].effect_id
+            for hid in plan.hypothesis_ids
+            if hid in self._hypotheses}))
+        paths: dict[str, TraceResult] = {}
+        for seed in seeds:
+            try:
+                paths[seed] = trial.trace(seed, set_id=plan.set_id)
+            except KeyError:
+                continue
+        return OutcomeAssessment(
+            outcome_id=outcome.outcome_id,
+            label=outcome.label,
+            excluded_hypothesis_ids=excluded,
+            retained_hypothesis_ids=retained,
+            supported_hypothesis_ids=supported,
+            indistinguishable_groups=groups,
+            retained_paths=paths,
+        )
+
+    def open_plan_outcome(self, plan_id: str, check_id: str,
+                          outcome_id: str) -> "InvestigationStore":
+        plan = self.verification_plan(plan_id)
+        check = self._find_planned_check(plan, check_id)
+        outcome = self._find_planned_outcome(check, outcome_id)
+        return self._open_planned_outcome(plan, check, outcome)
+
+    def _open_planned_outcome(self, plan: VerificationPlan,
+                              check: PlannedCheck, outcome
+                              ) -> "InvestigationStore":
+        trial = InvestigationStore.restore(
+            copy.deepcopy(plan.baseline_snapshot))
+        records = [self._prospective_record(plan, check, outcome, record)
+                   for record in outcome.records]
+        existing = list(plan.baseline_snapshot.get("records", {})
+                        .get(check.source_id, ()))
+        trial.import_source(check.source_id, [*existing, *records],
+                            description=f"prospective:{plan.plan_id}:"
+                                        f"{check.check_id}:{outcome.outcome_id}")
+        return trial
+
+    @staticmethod
+    def _prospective_record(plan: VerificationPlan, check: PlannedCheck,
+                            outcome, record: dict[str, Any]) -> dict[str, Any]:
+        item = dict(record)
+        original_id = item.get("record_id", "result")
+        item["record_id"] = (
+            f"__plan__:{plan.plan_id}:{check.check_id}:"
+            f"{outcome.outcome_id}:{original_id}")
+        return item
+
+    @staticmethod
+    def _find_planned_check(plan: VerificationPlan, check_id: str) -> PlannedCheck:
+        for check in plan.checks:
+            if check.check_id == check_id:
+                return check
+        raise KeyError(f"unknown planned check: {check_id!r}")
+
+    @staticmethod
+    def _find_planned_outcome(check: PlannedCheck, outcome_id: str):
+        for outcome in check.outcomes:
+            if outcome.outcome_id == outcome_id:
+                return outcome
+        raise KeyError(f"unknown planned outcome: {outcome_id!r}")
+
+    @staticmethod
+    def _indistinguishable_groups(
+        hypotheses: list[Hypothesis]
+    ) -> tuple[tuple[str, ...], ...]:
+        groups: list[tuple[str, ...]] = []
+        for index, left in enumerate(hypotheses):
+            peers = tuple(sorted(
+                right.hypothesis_id for right in hypotheses[index + 1:]
+                if left.effect_id == right.effect_id
+                and left.relation == right.relation
+                and left.cause_id != right.cause_id
+                and InvestigationStore._windows_overlap(left, right)))
+            if peers:
+                groups.append(tuple(sorted((left.hypothesis_id, *peers))))
+        return tuple(groups)
+
+    @staticmethod
+    def _outcome_supports(plan: VerificationPlan, check: PlannedCheck,
+                          outcome, after: Hypothesis,
+                          before: Hypothesis | None) -> bool:
+        prefix = (f"__plan__:{plan.plan_id}:{check.check_id}:"
+                  f"{outcome.outcome_id}:")
+        new_claims = {claim for claim in after.active_claims
+                      if claim.source_id == check.source_id
+                      and claim.record_id.startswith(prefix)}
+        return bool(new_claims) or (
+            before is not None
+            and after.active_claims != before.active_claims)
+
+    # ------------------------------------------------ received evidence flow
+
+    def receive_evidence(
+        self, source_id: str, records: Iterable[dict[str, Any]],
+        *,
+        batch_id: str | None = None,
+        description: str = "",
+        plan_id: str | None = None,
+        check_id: str | None = None,
+        outcome_id: str | None = None,
+    ) -> str:
+        source_id = str(source_id)
+        items = tuple(dict(record) for record in records)
+        if not items:
+            raise ImportError("received evidence requires records")
+        if batch_id is None:
+            batch_id = f"batch-{len(self._received_batches) + 1}"
+        batch_id = str(batch_id)
+        if batch_id in self._received_batches:
+            raise ImportError(f"received batch {batch_id!r} already exists")
+        if plan_id is not None:
+            plan = self.verification_plan(plan_id)
+            if check_id is not None:
+                check = self._find_planned_check(plan, check_id)
+                if outcome_id is not None:
+                    self._find_planned_outcome(check, outcome_id)
+        batch = ReceivedBatch(
+            batch_id=batch_id,
+            source_id=source_id,
+            records=items,
+            received_at=time.time(),
+            plan_id=plan_id,
+            check_id=check_id,
+            outcome_id=outcome_id,
+            description=description,
+        )
+        self._received_batches[batch_id] = batch
+        return batch_id
+
+    def received_batches(self, status: str | None = None) -> list[ReceivedBatch]:
+        return [batch for batch in (self._received_batches[key]
+                                    for key in sorted(self._received_batches))
+                if status is None or batch.status == status]
+
+    def received_batch(self, batch_id: str) -> ReceivedBatch:
+        return self._received_batches[str(batch_id)]
+
+    def review_received_evidence(self, batch_id: str) -> dict[str, Any]:
+        batch = self.received_batch(batch_id)
+        mismatches: list[str] = []
+        contradictions: list[str] = []
+        expected_records: list[dict[str, Any]] = []
+        if batch.plan_id and batch.check_id:
+            plan = self.verification_plan(batch.plan_id)
+            check = self._find_planned_check(plan, batch.check_id)
+            planned_outcomes = [self._find_planned_outcome(check, batch.outcome_id)] \
+                if batch.outcome_id else list(check.outcomes)
+            for outcome in planned_outcomes:
+                expected_records.extend(outcome.records)
+                if not self._records_match_plan(batch.records, outcome.records):
+                    mismatches.append(
+                        f"material does not match outcome {outcome.outcome_id!r}")
+            if batch.outcome_id:
+                outcome = planned_outcomes[0]
+                contradictions.extend(self._contradictions_to_outcome(
+                    check, outcome, batch.records))
+            else:
+                if not any(self._records_match_plan(batch.records, outcome.records)
+                           for outcome in check.outcomes):
+                    contradictions.append(
+                        "material matches none of the planned possible outcomes")
+        duplicate_claims = self._duplicate_claims(batch)
+        shared_sources = self._shared_planned_sources(batch)
+        return {
+            "batch_id": batch.batch_id,
+            "status": batch.status,
+            "mismatches": tuple(mismatches),
+            "contradictions": tuple(contradictions),
+            "duplicate_claims": tuple(duplicate_claims),
+            "shared_planned_sources": tuple(shared_sources),
+            "unexpected": not bool(batch.plan_id and batch.check_id),
+        }
+
+    @staticmethod
+    def _records_match_plan(actual: tuple[dict[str, Any], ...],
+                           expected: tuple[dict[str, Any], ...]) -> bool:
+        def fingerprint(record: dict[str, Any]) -> tuple:
+            return tuple(sorted((key, str(value)) for key, value in record.items()
+                                if key not in {"record_id", "source_id"}))
+
+        return {fingerprint(item) for item in actual} == \
+            {fingerprint(item) for item in expected}
+
+    def _contradictions_to_outcome(self, check: PlannedCheck, outcome,
+                                   records: tuple[dict[str, Any], ...]) -> list[str]:
+        problems: list[str] = []
+        expected_relations = {
+            (str(ref.get("relation", "related")),
+             str(ref.get("direction", "incoming")), str(ref.get("target", "")))
+            for record in outcome.records for ref in record.get("refs", ())}
+        for record in records:
+            for ref in record.get("refs", ()):
+                actual = (str(ref.get("relation", "related")),
+                          str(ref.get("direction", "incoming")),
+                          str(ref.get("target", "")))
+                if check.target is not None and actual[0] == check.relation and (
+                        actual[1] != check.direction or actual[2] != check.target):
+                    problems.append(
+                        f"record {record.get('record_id')!r} asserts "
+                        f"{actual[1]} {actual[0]} -> {actual[2]}, planned "
+                        f"{check.direction} {check.relation} -> {check.target}")
+                if expected_relations and not any(
+                        actual[0] == item[0] and actual[1] == item[1]
+                        for item in expected_relations):
+                    problems.append(
+                        f"record {record.get('record_id')!r} has relationship "
+                        f"{actual[0]!r} not present in the planned outcome")
+        return problems
+
+    def _duplicate_claims(self, batch: ReceivedBatch) -> tuple[str, ...]:
+        duplicates: set[str] = set()
+        for record in batch.records:
+            fingerprint = self._claim_fingerprint(record)
+            for sid, existing_batch in self._records.items():
+                for record_id, existing in existing_batch.items():
+                    if self._claim_fingerprint(existing) == fingerprint:
+                        duplicates.add(f"accepted:{sid}:{record_id}")
+            for other in self._received_batches.values():
+                if other.batch_id == batch.batch_id:
+                    continue
+                for other_record in other.records:
+                    if self._claim_fingerprint(other_record) == fingerprint:
+                        duplicates.add(
+                            f"pending:{other.batch_id}:"
+                            f"{other_record.get('record_id')}")
+        return tuple(sorted(duplicates))
+
+    @staticmethod
+    def _claim_fingerprint(record: dict[str, Any]) -> tuple:
+        return tuple(sorted((key, str(value)) for key, value in record.items()
+                            if key not in {"record_id", "source_id"}))
+
+    def _shared_planned_sources(self, batch: ReceivedBatch) -> tuple[str, ...]:
+        shared = {
+            plan.plan_id
+            for plan in self._verification_plans.values()
+            if plan.plan_id != batch.plan_id
+            and any(check.source_id == batch.source_id for check in plan.checks)}
+        return tuple(sorted(shared))
+
+    def accept_evidence(
+        self, batch_id: str, *,
+        record_ids: Iterable[str] | None = None,
+        reason: str = "",
+    ) -> EvidenceDecision:
+        batch = self.received_batch(batch_id)
+        if batch.status not in {"pending", "partially_accepted"}:
+            raise ImportError(f"batch {batch.batch_id!r} is {batch.status}")
+        wanted = None if record_ids is None else {str(item) for item in record_ids}
+        selected = tuple(record for record in batch.records
+                         if wanted is None
+                         or str(record.get("record_id")) in wanted)
+        if wanted and len(selected) != len(wanted):
+            raise KeyError("unknown record id in acceptance scope")
+        before = dict(self._hypotheses)
+        current = list(self._records.get(batch.source_id, {}).values())
+        current_ids = {str(record.get("record_id")) for record in current}
+        selected_ids = {str(record.get("record_id")) for record in selected}
+        merged = current + [record for record in selected
+                            if str(record.get("record_id")) not in current_ids]
+        if merged:
+            self.import_source(batch.source_id, merged)
+        after = dict(self._hypotheses)
+        decision = EvidenceDecision(
+            decision_id=f"decision-{len(self._evidence_decisions) + 1}",
+            batch_id=batch.batch_id,
+            source_id=batch.source_id,
+            action="accepted" if wanted is None else "partially_accepted",
+            recorded_at=time.time(),
+            record_ids=frozenset(selected_ids),
+            reason=reason,
+            excluded_hypotheses=frozenset(
+                hid for hid, hypothesis in before.items()
+                if not hypothesis.is_retracted
+                and hid in after and after[hid].is_retracted),
+        )
+        self._evidence_decisions.append(decision)
+        batch.status = "accepted" if wanted is None else "partially_accepted"
+        return decision
+
+    def reject_evidence(self, batch_id: str, *, reason: str = "") -> EvidenceDecision:
+        batch = self.received_batch(batch_id)
+        decision = EvidenceDecision(
+            decision_id=f"decision-{len(self._evidence_decisions) + 1}",
+            batch_id=batch.batch_id,
+            source_id=batch.source_id,
+            action="rejected",
+            recorded_at=time.time(),
+            record_ids=frozenset(str(record.get("record_id"))
+                                 for record in batch.records),
+            reason=reason,
+        )
+        self._evidence_decisions.append(decision)
+        batch.status = "rejected"
+        return decision
+
+    def withdraw_evidence(
+        self, batch_id: str, *,
+        record_ids: Iterable[str] | None = None,
+        reason: str = "",
+    ) -> EvidenceDecision:
+        batch = self.received_batch(batch_id)
+        accepted_ids = self._accepted_record_ids(batch)
+        wanted = None if record_ids is None else {str(item) for item in record_ids}
+        withdraw_ids = accepted_ids if wanted is None else accepted_ids & wanted
+        if wanted and not withdraw_ids:
+            raise KeyError("no accepted record from that batch is in scope")
+        remaining = [record for record_id, record
+                     in self._records.get(batch.source_id, {}).items()
+                     if record_id not in withdraw_ids]
+        if remaining:
+            self.import_source(batch.source_id, remaining)
+        elif batch.source_id in self._records:
+            self.revoke_source(batch.source_id)
+        decision = EvidenceDecision(
+            decision_id=f"decision-{len(self._evidence_decisions) + 1}",
+            batch_id=batch.batch_id,
+            source_id=batch.source_id,
+            action="withdrawn",
+            recorded_at=time.time(),
+            record_ids=frozenset(withdraw_ids),
+            reason=reason,
+        )
+        self._evidence_decisions.append(decision)
+        batch.status = "withdrawn"
+        return decision
+
+    def _accepted_record_ids(self, batch: ReceivedBatch) -> set[str]:
+        accepted = set()
+        for decision in self._evidence_decisions:
+            if decision.batch_id == batch.batch_id and decision.action in {
+                    "accepted", "partially_accepted"}:
+                accepted |= decision.record_ids
+            if decision.batch_id == batch.batch_id and decision.action == "withdrawn":
+                accepted -= decision.record_ids
+        return accepted
+
+    def evidence_decisions(self) -> list[EvidenceDecision]:
+        return list(self._evidence_decisions)
+
     # -------------------------------------------------------- working sets
 
     def create_hypothesis_set(
@@ -1126,7 +1591,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 3,
+            "version": 4,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -1171,6 +1636,15 @@ class InvestigationStore:
                  "valid": state.valid}
                 for state in self.saved_paths()
             ],
+            "verification_plans": [
+                plan.as_dict() for plan in self.verification_plans()
+            ],
+            "received_batches": [
+                batch.as_dict() for batch in self.received_batches()
+            ],
+            "evidence_decisions": [
+                decision.as_dict() for decision in self._evidence_decisions
+            ],
             "manual_judgments": [
                 {"link_id": judgment.link_id, "action": judgment.action,
                  "recorded_at": judgment.recorded_at, "note": judgment.note,
@@ -1204,7 +1678,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3):
+        if data.get("version") not in (1, 2, 3, 4):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -1295,4 +1769,12 @@ class InvestigationStore:
                 store._manual_judgments.append(ManualJudgment(
                     link_id=link.link_id, action="created", link=link,
                     recorded_at=link.created_at))
+        for item in data.get("verification_plans", ()):
+            plan = VerificationPlan.from_dict(item)
+            store._verification_plans[plan.plan_id] = plan
+        for item in data.get("received_batches", ()):
+            batch = ReceivedBatch.from_dict(item)
+            store._received_batches[batch.batch_id] = batch
+        for item in data.get("evidence_decisions", ()):
+            store._evidence_decisions.append(EvidenceDecision.from_dict(item))
         return store

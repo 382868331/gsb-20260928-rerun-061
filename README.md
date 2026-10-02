@@ -47,6 +47,16 @@
   的证据、假设选择与路径。`reopen()` 重开当时的判断；
   `compare_with_latest()` 在不改动旧归档的前提下，与最新证据下重放同一
   选择做差异对比（新增/消失的因果跳、未决引用、所选假设是否已失效）。
+- **计划不是事实**：`create_verification_plan(...)` 保存每轮待核查关系、
+  可能结果和当时假设。`assess_plan_outcome(...)` 在私有快照中试算每种结果
+  会排除/保留哪些候选、仍无法区分哪些组、路径如何变化；
+  `open_plan_outcome(...)` 可基于另一种可能结果建立独立研究，主调查不被修改。
+- **新材料先审后纳**：`receive_evidence(...)` 只把材料放入暂存区。
+  `review_received_evidence(...)` 先返回与计划不一致、互相矛盾、共用来源和
+  重复声明信息；重复确认只提示重复，不会被描述成新的独立来源。用户随后用
+  `accept_evidence(..., record_ids=...)` 决定采纳范围，或 `reject_evidence(...)`。
+- **撤回可追查**：`withdraw_evidence(...)` 会从当前事实图移除后来证据并重算，
+  但接受、排除原因、撤回等 `evidence_decisions()` 审计记录继续保留。
 
 ## 记录格式
 
@@ -123,9 +133,45 @@ diff = book.compare_with_latest(finding_id, store)
 book.save("casebook.json")              # append-only，永不覆盖旧判断
 ```
 
+### 核查计划、试算与材料采纳
+
+```python
+plan = store.create_verification_plan("round-1", [{
+    "check_id": "check-parent",
+    "label": "核查 child 的父进程",
+    "source_id": "memory-team",
+    "relation": "parent",
+    "target": "guid:parent-a",
+    "outcomes": [
+        {"outcome_id": "supports-a", "records": [...]},
+        {"outcome_id": "supports-b", "records": [...]},
+    ],
+}], seeds=["guid:child"])
+
+preview = store.assess_plan_outcome("round-1", "check-parent", "supports-a")
+preview.excluded_hypothesis_ids
+preview.retained_hypothesis_ids
+preview.indistinguishable_groups
+preview.retained_paths
+
+# 另一个可能结果的独立研究；不影响当前 store
+branch = store.open_plan_outcome("round-1", "check-parent", "supports-b")
+
+batch_id = store.receive_evidence(
+    "memory-team", incoming_records,
+    plan_id="round-1", check_id="check-parent", outcome_id="supports-a")
+review = store.review_received_evidence(batch_id)
+if not review["contradictions"]:
+    store.accept_evidence(batch_id, record_ids=["record-1"], reason="...")
+store.withdraw_evidence(batch_id, reason="...")
+store.evidence_decisions()
+```
+
 ## 文件
 
 - `investigation/models.py`：事件、来源、边、未决引用、人工关联、假设模型
+- `investigation/store.py`：核查计划、结果试算、材料暂存/采纳/撤回审计，
+  以及导入、假设集、追踪、路径失效和快照序列化
 - `investigation/store.py`：导入/撤销、身份归并、冲突分组、假设集、
   按假设追踪、路径增量失效、快照序列化
 - `investigation/casebook.py`：append-only 归档、历史重开、最新证据对比

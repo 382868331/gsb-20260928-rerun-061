@@ -163,8 +163,11 @@ class Hypothesis:
             "effect_id": self.effect_id,
             "relation": self.relation,
             "cause_id": self.cause_id,
-            "claims": [c.as_dict() for c in sorted(self.claims)],
-            "retracted_claims": [c.as_dict() for c in sorted(self.retracted_claims)],
+            "claims": [c.as_dict() for c in sorted(
+                self.claims, key=lambda item: (item.source_id, item.record_id))],
+            "retracted_claims": [c.as_dict() for c in sorted(
+                self.retracted_claims,
+                key=lambda item: (item.source_id, item.record_id))],
             "scopes": sorted(self.scopes),
             "confidence": self.confidence,
             "origins": sorted(self.origins),
@@ -172,3 +175,191 @@ class Hypothesis:
             "valid_end": self.valid_end,
             "retracted": self.is_retracted,
         }
+
+
+@dataclass
+class PlannedOutcome:
+    """One explicitly hypothetical result of a planned check."""
+
+    outcome_id: str
+    label: str
+    records: tuple[dict[str, Any], ...] = ()
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "outcome_id": self.outcome_id,
+            "label": self.label,
+            "records": [dict(record) for record in self.records],
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlannedOutcome":
+        return cls(
+            outcome_id=str(data["outcome_id"]),
+            label=str(data.get("label", data["outcome_id"])),
+            records=tuple(dict(record) for record in data.get("records", ())),
+            note=str(data.get("note", "")),
+        )
+
+
+@dataclass
+class PlannedCheck:
+    """A relationship/result source that analysts intend to verify."""
+
+    check_id: str
+    label: str
+    source_id: str
+    relation: str
+    target: str | None = None
+    direction: str = "incoming"
+    outcomes: tuple[PlannedOutcome, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "check_id": self.check_id,
+            "label": self.label,
+            "source_id": self.source_id,
+            "relation": self.relation,
+            "target": self.target,
+            "direction": self.direction,
+            "outcomes": [outcome.as_dict() for outcome in self.outcomes],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlannedCheck":
+        return cls(
+            check_id=str(data["check_id"]),
+            label=str(data.get("label", data["check_id"])),
+            source_id=str(data["source_id"]),
+            relation=str(data["relation"]),
+            target=data.get("target"),
+            direction=str(data.get("direction", "incoming")),
+            outcomes=tuple(PlannedOutcome.from_dict(item)
+                           for item in data.get("outcomes", ())),
+        )
+
+
+@dataclass
+class VerificationPlan:
+    """A saved round of planned checks plus the hypotheses then visible."""
+
+    plan_id: str
+    checks: tuple[PlannedCheck, ...]
+    created_at: float | None
+    set_id: str | None
+    hypothesis_ids: frozenset[str]
+    seeds: tuple[str, ...] = ()
+    description: str = ""
+    baseline_snapshot: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "checks": [check.as_dict() for check in self.checks],
+            "created_at": self.created_at,
+            "set_id": self.set_id,
+            "hypothesis_ids": sorted(self.hypothesis_ids),
+            "seeds": list(self.seeds),
+            "description": self.description,
+            "baseline_snapshot": self.baseline_snapshot,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VerificationPlan":
+        return cls(
+            plan_id=str(data["plan_id"]),
+            checks=tuple(PlannedCheck.from_dict(item)
+                         for item in data.get("checks", ())),
+            created_at=data.get("created_at"),
+            set_id=data.get("set_id"),
+            hypothesis_ids=frozenset(data.get("hypothesis_ids", ())),
+            seeds=tuple(data.get("seeds", ())),
+            description=str(data.get("description", "")),
+            baseline_snapshot=dict(data.get("baseline_snapshot", {})),
+        )
+
+
+@dataclass
+class ReceivedBatch:
+    """Incoming material held outside accepted evidence until reviewed."""
+
+    batch_id: str
+    source_id: str
+    records: tuple[dict[str, Any], ...]
+    received_at: float | None
+    plan_id: str | None = None
+    check_id: str | None = None
+    outcome_id: str | None = None
+    description: str = ""
+    status: str = "pending"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "source_id": self.source_id,
+            "records": [dict(record) for record in self.records],
+            "received_at": self.received_at,
+            "plan_id": self.plan_id,
+            "check_id": self.check_id,
+            "outcome_id": self.outcome_id,
+            "description": self.description,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ReceivedBatch":
+        return cls(
+            batch_id=str(data["batch_id"]),
+            source_id=str(data["source_id"]),
+            records=tuple(dict(record) for record in data.get("records", ())),
+            received_at=data.get("received_at"),
+            plan_id=data.get("plan_id"),
+            check_id=data.get("check_id"),
+            outcome_id=data.get("outcome_id"),
+            description=str(data.get("description", "")),
+            status=str(data.get("status", "pending")),
+        )
+
+
+@dataclass
+class EvidenceDecision:
+    """Audit record for material accepted, rejected, or withdrawn."""
+
+    decision_id: str
+    batch_id: str
+    source_id: str
+    action: str
+    recorded_at: float | None
+    record_ids: frozenset[str]
+    reason: str = ""
+    supersedes: frozenset[str] = frozenset()
+    excluded_hypotheses: frozenset[str] = frozenset()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "batch_id": self.batch_id,
+            "source_id": self.source_id,
+            "action": self.action,
+            "recorded_at": self.recorded_at,
+            "record_ids": sorted(self.record_ids),
+            "reason": self.reason,
+            "supersedes": sorted(self.supersedes),
+            "excluded_hypotheses": sorted(self.excluded_hypotheses),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvidenceDecision":
+        return cls(
+            decision_id=str(data["decision_id"]),
+            batch_id=str(data["batch_id"]),
+            source_id=str(data["source_id"]),
+            action=str(data["action"]),
+            recorded_at=data.get("recorded_at"),
+            record_ids=frozenset(data.get("record_ids", ())),
+            reason=str(data.get("reason", "")),
+            supersedes=frozenset(data.get("supersedes", ())),
+            excluded_hypotheses=frozenset(data.get("excluded_hypotheses", ())),
+        )

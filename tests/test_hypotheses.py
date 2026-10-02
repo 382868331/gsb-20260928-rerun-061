@@ -364,3 +364,140 @@ def test_saved_hypothesis_sets_cannot_be_overwritten():
     store.create_hypothesis_set("v1", [group.hypotheses[0].hypothesis_id])
     with pytest.raises(Exception):
         store.create_hypothesis_set("v1", [group.hypotheses[0].hypothesis_id])
+
+
+def test_planned_outcomes_preview_exclusions_without_mutating_case():
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", 1, guid="child", parent="pa"),
+        proc("pa", 2, guid="pa"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    group = store.conflict_groups()[0]
+    a_hyp = next(h for h in group.hypotheses if h.cause_id.endswith(":pa"))
+    b_hyp = next(h for h in group.hypotheses if h.cause_id.endswith(":pb"))
+
+    def outcome(parent, retract):
+        return {
+            "outcome_id": f"says-{parent}",
+            "label": f"parent is {parent}",
+            "records": [{
+                "record_id": "result",
+                "kind": "process",
+                "aliases": ["guid:child"],
+                "retracts": [{"source_id": retract[0],
+                              "record_id": retract[1]}],
+                "refs": [{"relation": "parent",
+                          "target": f"guid:{parent}"}],
+            }],
+        }
+
+    plan = store.create_verification_plan("round-1", [{
+        "check_id": "parent-check",
+        "label": "verify parent",
+        "source_id": "follow-up",
+        "relation": "parent",
+        "target": "guid:pa",
+        "outcomes": [
+            outcome("pa", ("b", "c2")),
+            outcome("pb", ("a", "c")),
+        ],
+    }], seeds=["guid:child"], description="discriminating follow-up")
+
+    says_a = store.assess_plan_outcome("round-1", "parent-check", "says-pa")
+    assert says_a.retained_hypothesis_ids == (a_hyp.hypothesis_id,)
+    assert says_a.excluded_hypothesis_ids == (b_hyp.hypothesis_id,)
+    assert says_a.indistinguishable_groups == ()
+    path, = says_a.retained_paths.values()
+    assert [hop.cause_id for hop in path.upstream] == [a_hyp.cause_id]
+
+    says_b = store.assess_plan_outcome("round-1", "parent-check", "says-pb")
+    assert says_b.retained_hypothesis_ids == (b_hyp.hypothesis_id,)
+    assert says_b.excluded_hypothesis_ids == (a_hyp.hypothesis_id,)
+
+    # The live store remains a genuine conflict: plans are not evidence.
+    assert len(store.conflict_groups()) == 1
+    assert "follow-up" not in {source.source_id for source in store.sources()}
+    independent = store.open_plan_outcome(
+        "round-1", "parent-check", "says-pa")
+    assert independent.get_event("guid:pb") is not None
+    assert store.get_event("a:pa") is not None
+
+
+def test_received_evidence_is_reviewed_then_accepted_and_withdrawn_with_audit(tmp_path):
+    store = InvestigationStore()
+    store.import_source("a", [
+        proc("c", 1, guid="child", parent="pa"),
+        proc("pa", 2, guid="pa"),
+    ])
+    store.import_source("b", [
+        proc("c2", 1, guid="child", parent="pb"),
+        proc("pb", 2, guid="pb"),
+    ])
+    group = store.conflict_groups()[0]
+    b_hyp = next(h for h in group.hypotheses if h.cause_id.endswith(":pb"))
+    plan_record = {
+        "record_id": "result",
+        "kind": "process",
+        "aliases": ["guid:child"],
+        "retracts": [{"source_id": "b", "record_id": "c2"}],
+        "refs": [{"relation": "parent", "target": "guid:pa"}],
+    }
+    store.create_verification_plan("round-1", [{
+        "check_id": "parent-check",
+        "label": "verify parent",
+        "source_id": "follow-up",
+        "relation": "parent",
+        "target": "guid:pa",
+        "outcomes": [{
+            "outcome_id": "says-pa",
+            "label": "parent is pa",
+            "records": [plan_record],
+        }],
+    }], seeds=["guid:child"])
+    second = store.create_verification_plan("round-2", [{
+        "check_id": "other-check",
+        "label": "same feed",
+        "source_id": "follow-up",
+        "relation": "parent",
+        "target": "guid:pa",
+        "outcomes": [{"outcome_id": "repeat", "records": [plan_record]}],
+    }])
+    assert second.plan_id == "round-2"
+
+    contradictory = dict(plan_record, record_id="actual")
+    contradictory["refs"] = [{"relation": "parent", "target": "guid:pb"}]
+    batch_id = store.receive_evidence(
+        "follow-up", [contradictory], plan_id="round-1",
+        check_id="parent-check", outcome_id="says-pa")
+    review = store.review_received_evidence(batch_id)
+    assert review["contradictions"]
+    assert "round-2" in review["shared_planned_sources"]
+    assert store.conflict_groups()
+
+    matching = dict(plan_record, record_id="actual")
+    duplicate_batch = store.receive_evidence("follow-up", [matching])
+    matching_batch = store.receive_evidence("follow-up", [matching])
+    store.accept_evidence(matching_batch, reason="memory correlation accepted")
+    duplicate_review = store.review_received_evidence(duplicate_batch)
+    assert duplicate_review["duplicate_claims"]
+    assert store.hypothesis_evidence(b_hyp.hypothesis_id).is_retracted
+
+    decision, = store.evidence_decisions()
+    assert decision.excluded_hypotheses == frozenset({b_hyp.hypothesis_id})
+    assert decision.reason == "memory correlation accepted"
+
+    store.withdraw_evidence(matching_batch, reason="later found unreliable")
+    assert not store.hypothesis_evidence(b_hyp.hypothesis_id).is_retracted
+    actions = [(d.action, d.reason) for d in store.evidence_decisions()]
+    assert actions[-1] == ("withdrawn", "later found unreliable")
+    assert actions[0] == ("accepted", "memory correlation accepted")
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "case.json"))
+    assert [d.action for d in reloaded.evidence_decisions()] == [
+        "accepted", "withdrawn"]
+    assert len(reloaded.verification_plans()) == 2
