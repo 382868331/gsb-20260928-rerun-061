@@ -501,3 +501,138 @@ def test_received_evidence_is_reviewed_then_accepted_and_withdrawn_with_audit(tm
     assert [d.action for d in reloaded.evidence_decisions()] == [
         "accepted", "withdrawn"]
     assert len(reloaded.verification_plans()) == 2
+
+
+def test_conditional_plan_budget_preview_counts_shared_prefix_once():
+    store = InvestigationStore()
+    plan = store.create_verification_plan("conditional", [
+        {
+            "check_id": "prefix",
+            "label": "common acquisition",
+            "source_id": "same-team",
+            "relation": "parent",
+            "cost": 4,
+            "required_materials": ["image"],
+            "outcomes": [
+                {"outcome_id": "need-a", "next_check_ids": ["branch-a"]},
+                {"outcome_id": "need-b", "next_check_ids": ["branch-b"]},
+            ],
+        },
+        {
+            "check_id": "branch-a",
+            "label": "a only",
+            "source_id": "a-team",
+            "relation": "parent",
+            "cost": 3,
+            "outcomes": [{"outcome_id": "done-a"}],
+        },
+        {
+            "check_id": "branch-b",
+            "label": "b only",
+            "source_id": "same-team",
+            "relation": "parent",
+            "cost": 7,
+            "outcomes": [{"outcome_id": "done-b"}],
+        },
+    ], budget=12, available_materials=["image"])
+
+    preview = store.preview_conditional_plan("conditional")
+    assert preview.available_now == ("prefix",)
+    assert preview.common_check_ids == ("prefix",)
+    assert preview.common_cost == 4
+    assert preview.worst_case_cost == 11
+    assert preview.budget_remaining_in_worst_case == 1
+    assert [path["check_ids"] for path in preview.paths] == [
+        ("prefix", "branch-a"), ("prefix", "branch-b")]
+    assert preview.repeated_source_checks == (
+        ("same-team", ("branch-b", "prefix")),)
+
+    comparison = store.compare_verification_plans("conditional")
+    assert comparison["plans"][0]["worst_case_total_cost"] == 11
+    assert comparison["plans"][0]["uncommitted_cost"] == 11
+
+
+def test_conditional_plan_run_waits_stops_out_of_range_and_restores(tmp_path):
+    store = InvestigationStore()
+    store.create_verification_plan("conditional", [
+        {
+            "check_id": "first",
+            "label": "first",
+            "source_id": "team",
+            "relation": "parent",
+            "cost": 2,
+            "outcomes": [
+                {"outcome_id": "continue", "next_check_ids": ["second"]},
+                {"outcome_id": "stop", "next_check_ids": []},
+            ],
+        },
+        {
+            "check_id": "second",
+            "label": "second",
+            "source_id": "team",
+            "relation": "parent",
+            "cost": 3,
+            "required_materials": ["deposition"],
+            "outcomes": [{"outcome_id": "done"}],
+        },
+    ], budget=10)
+    run = store.start_plan_run("conditional", "run-1")
+    assert run.check_states["first"] == "available"
+    assert run.check_states["second"] == "waiting"
+
+    store.start_plan_check("run-1", "first")
+    store.record_plan_check_result("run-1", "first", "continue",
+                                   batch_id="batch-1")
+    assert run.check_states["second"] == "blocked"
+    assert store.preview_conditional_plan("conditional", "run-1").uncommitted_cost == 3
+
+    store.add_plan_material("run-1", "deposition")
+    assert run.check_states["second"] == "available"
+    store.start_plan_check("run-1", "second")
+    store.withdraw_plan_material("run-1", "deposition", note="source recalled")
+    assert run.check_states["second"] == "blocked"
+    store.add_plan_material("run-1", "deposition", note="replacement supplied")
+    store.start_plan_check("run-1", "second")
+
+    store.record_plan_check_result("run-1", "second", "unexpected")
+    assert run.status == "active"
+    assert run.check_states["second"] == "out_of_range"
+    assert run.spent_cost == 5
+    assert [(event.action, event.check_id, event.outcome_id) for event in run.events
+            if event.action in {"result_recorded", "out_of_range"}][-1] == (
+        "out_of_range", "second", "unexpected")
+
+    store.pause_plan_run("run-1")
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "run.json"))
+    restored = reloaded.plan_run("run-1")
+    assert restored.status == "paused"
+    assert restored.evidence_batches == {"first": "batch-1"}
+    assert restored.actual_costs == {"first": 2.0, "second": 3.0}
+
+
+def test_terminated_plan_keeps_costs_but_allows_replacing_unexecuted_plan():
+    store = InvestigationStore()
+    store.create_verification_plan("conditional", [
+        {"check_id": "first", "label": "first", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [{"outcome_id": "continue",
+                       "next_check_ids": ["second"]}]},
+        {"check_id": "second", "label": "second", "source_id": "team",
+         "relation": "parent", "cost": 3,
+         "outcomes": [{"outcome_id": "done"}]},
+    ])
+    run = store.start_plan_run("conditional", "run-1")
+    store.start_plan_check("run-1", "first")
+    store.record_plan_check_result("run-1", "first", "continue")
+    store.terminate_plan_run("run-1", note="user stopped")
+    assert run.check_states["second"] == "uncommitted"
+    assert run.spent_cost == 2
+
+    replacement = store.revise_verification_plan("conditional", [
+        {"check_id": "replacement", "label": "replacement",
+         "source_id": "other", "relation": "parent", "cost": 1,
+         "outcomes": [{"outcome_id": "done"}]},
+    ])
+    assert [check.check_id for check in replacement.checks] == ["replacement"]
+    assert store.plan_run("run-1").events[-1].action == "terminated"

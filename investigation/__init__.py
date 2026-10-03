@@ -9,6 +9,8 @@ from .models import (
     ManualLink,
     PlannedCheck,
     PlannedOutcome,
+    PlanRun,
+    PlanRunEvent,
     PendingRef,
     ReceivedBatch,
     RecordRef,
@@ -17,6 +19,7 @@ from .models import (
 )
 from .store import ImportError as InvestigationImportError
 from .store import (
+    ConditionalPlanPreview,
     ConflictGroup,
     OutcomeAssessment,
     HypothesisSet,
@@ -37,6 +40,7 @@ __all__ = [
     "ManualLink",
     "MANUAL_SOURCE",
     "ConflictGroup",
+    "ConditionalPlanPreview",
     "OutcomeAssessment",
     "HypothesisSet",
     "HypothesisSetExplanation",
@@ -48,6 +52,8 @@ __all__ = [
     "Source",
     "PlannedCheck",
     "PlannedOutcome",
+    "PlanRun",
+    "PlanRunEvent",
     "VerificationPlan",
     "ReceivedBatch",
     "EvidenceDecision",

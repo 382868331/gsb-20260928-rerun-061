@@ -14,6 +14,8 @@ from .models import (
     Hypothesis,
     EvidenceDecision,
     ManualLink,
+    PlanRun,
+    PlanRunEvent,
     PlannedCheck,
     PendingRef,
     ReceivedBatch,
@@ -122,6 +124,37 @@ class OutcomeAssessment:
     prospective: bool = True
 
 
+@dataclass(frozen=True)
+class ConditionalPlanPreview:
+    plan_id: str
+    available_now: tuple[str, ...]
+    waiting: tuple[tuple[str, tuple[str, ...]], ...]
+    paths: tuple[dict[str, Any], ...]
+    common_check_ids: tuple[str, ...]
+    common_cost: float
+    worst_case_cost: float
+    uncommitted_cost: float
+    budget_remaining_in_worst_case: float | None
+    repeated_source_checks: tuple[tuple[str, tuple[str, ...]], ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "available_now": list(self.available_now),
+            "waiting": [{"check_id": check_id, "missing_materials": list(materials)}
+                        for check_id, materials in self.waiting],
+            "paths": list(self.paths),
+            "common_check_ids": list(self.common_check_ids),
+            "common_cost": self.common_cost,
+            "worst_case_cost": self.worst_case_cost,
+            "uncommitted_cost": self.uncommitted_cost,
+            "budget_remaining_in_worst_case": self.budget_remaining_in_worst_case,
+            "repeated_source_checks": [
+                {"source_id": sid, "check_ids": list(check_ids)}
+                for sid, check_ids in self.repeated_source_checks],
+        }
+
+
 class InvestigationStore:
     """In-memory evidence graph, rebuilt deterministically from raw records.
 
@@ -155,6 +188,7 @@ class InvestigationStore:
         # Saved investigation paths, invalidated incrementally on change.
         self._paths: dict[tuple[str, str | None, int | None], PathState] = {}
         self._verification_plans: dict[str, VerificationPlan] = {}
+        self._plan_runs: dict[str, PlanRun] = {}
         self._received_batches: dict[str, ReceivedBatch] = {}
         self._evidence_decisions: list[EvidenceDecision] = []
 
@@ -876,6 +910,8 @@ class InvestigationStore:
         seeds: Iterable[str] = (),
         set_id: str | None = "__active__",
         description: str = "",
+        budget: float | None = None,
+        available_materials: Iterable[str] = (),
     ) -> VerificationPlan:
         if not plan_id or not isinstance(plan_id, str):
             raise ImportError("plan_id must be a non-empty string")
@@ -888,6 +924,9 @@ class InvestigationStore:
         if not normalized_checks:
             raise ImportError("a verification plan requires at least one check")
         self._validate_planned_checks(normalized_checks)
+        if budget is not None and float(budget) < 0:
+            raise ImportError("verification budget cannot be negative")
+        material_set = frozenset(str(item) for item in available_materials)
         if set_id == "__active__":
             set_id = self.active_set
         if set_id is not None and set_id not in self._hyp_sets:
@@ -902,6 +941,8 @@ class InvestigationStore:
             seeds=tuple(seed_list),
             description=description,
             baseline_snapshot=copy.deepcopy(self.snapshot()),
+            budget=None if budget is None else float(budget),
+            available_materials=material_set,
         )
         self._verification_plans[plan_id] = plan
         return plan
@@ -911,7 +952,15 @@ class InvestigationStore:
         check_ids = [check.check_id for check in checks]
         if len(check_ids) != len(set(check_ids)):
             raise ImportError("check_id values must be unique within a plan")
+        by_id = {check.check_id: check for check in checks}
+        incoming = {check.check_id: set() for check in checks}
         for check in checks:
+            if check.cost < 0:
+                raise ImportError(f"check {check.check_id!r} cost cannot be negative")
+            if check.available_start is not None and check.available_end is not None \
+                    and check.available_start > check.available_end:
+                raise ImportError(
+                    f"check {check.check_id!r} has an invalid availability window")
             outcome_ids = [outcome.outcome_id for outcome in check.outcomes]
             if not check.outcomes:
                 raise ImportError(
@@ -919,6 +968,34 @@ class InvestigationStore:
             if len(outcome_ids) != len(set(outcome_ids)):
                 raise ImportError(
                     f"outcome ids in check {check.check_id!r} must be unique")
+            for outcome in check.outcomes:
+                for next_id in outcome.next_check_ids:
+                    if next_id not in by_id:
+                        raise ImportError(
+                            f"outcome {outcome.outcome_id!r} in check "
+                            f"{check.check_id!r} points to unknown check {next_id!r}")
+                for next_id in outcome.next_check_ids:
+                    incoming[next_id].add(check.check_id)
+        roots = {check_id for check_id, parents in incoming.items() if not parents}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def walk(check_id: str) -> None:
+            if check_id in visited:
+                return
+            if check_id in visiting:
+                raise ImportError("conditional verification plan cannot contain a cycle")
+            visiting.add(check_id)
+            for outcome in by_id[check_id].outcomes:
+                for next_id in outcome.next_check_ids:
+                    walk(next_id)
+            visiting.remove(check_id)
+            visited.add(check_id)
+
+        for root in roots:
+            walk(root)
+        if visited != set(by_id):
+            raise ImportError("every conditional check must be reachable from a root check")
 
     @staticmethod
     def _planned_check_from_dict(data: dict[str, Any]) -> PlannedCheck:
@@ -931,6 +1008,11 @@ class InvestigationStore:
             relation=str(data["relation"]),
             target=data.get("target"),
             direction=str(data.get("direction", "incoming")),
+            cost=float(data.get("cost", 0.0)),
+            available_start=data.get("available_start"),
+            available_end=data.get("available_end"),
+            required_materials=tuple(str(item)
+                                     for item in data.get("required_materials", ())),
             outcomes=tuple(
                 PlannedOutcome(
                     outcome_id=str(item["outcome_id"]),
@@ -938,6 +1020,8 @@ class InvestigationStore:
                     records=tuple(dict(record)
                                   for record in item.get("records", ())),
                     note=str(item.get("note", "")),
+                    next_check_ids=tuple(str(n)
+                                         for n in item.get("next_check_ids", ())),
                 )
                 for item in data.get("outcomes", ())),
         )
@@ -948,6 +1032,429 @@ class InvestigationStore:
 
     def verification_plan(self, plan_id: str) -> VerificationPlan:
         return self._verification_plans[plan_id]
+
+    def preview_conditional_plan(self, plan_id: str,
+                                 run_id: str | None = None) -> ConditionalPlanPreview:
+        plan = self.verification_plan(plan_id)
+        run = self.plan_run(run_id) if run_id is not None else None
+        spent = run.spent_cost if run is not None else 0.0
+        materials = set(plan.available_materials)
+        if run is not None:
+            materials |= set(run.available_materials)
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        if run is not None:
+            available = tuple(sorted(
+                check_id for check_id, state in run.check_states.items()
+                if state == "available"))
+        else:
+            available = tuple(sorted(
+                check.check_id for check in plan.checks
+                if not incoming[check.check_id]
+                and set(check.required_materials) <= materials))
+        if run is not None:
+            waiting = tuple(
+                (check_id,
+                 tuple(sorted(set(by_id[check_id].required_materials)
+                              - set(materials))))
+                for check_id in sorted(run.check_states)
+                if run.check_states[check_id] in {"waiting", "blocked"})
+        else:
+            waiting = tuple(
+                (check.check_id,
+                 tuple(sorted(set(check.required_materials) - set(materials))))
+                for check in sorted(plan.checks, key=lambda item: item.check_id)
+                if set(check.required_materials) - set(materials))
+        paths = self._conditional_plan_paths(plan, run)
+        all_check_sets = [set(path["check_ids"]) for path in paths]
+        common = tuple(sorted(set.intersection(*all_check_sets))) if all_check_sets else ()
+        common_cost = sum(by_id[check_id].cost for check_id in common)
+        worst_cost = max(
+            (float(path["additional_cost"]) if run is not None
+             else float(path["total_cost"])
+             for path in paths),
+            default=0.0)
+        repeated: dict[str, list[str]] = defaultdict(list)
+        for check in plan.checks:
+            repeated[check.source_id].append(check.check_id)
+        repeated_tuple = tuple(sorted(
+            (sid, tuple(sorted(check_ids)))
+            for sid, check_ids in repeated.items() if len(check_ids) > 1))
+        budget_left = None if plan.budget is None else plan.budget - spent - worst_cost
+        return ConditionalPlanPreview(
+            plan_id=plan_id,
+            available_now=available,
+            waiting=waiting,
+            paths=tuple(paths),
+            common_check_ids=common,
+            common_cost=common_cost,
+            worst_case_cost=worst_cost,
+            uncommitted_cost=worst_cost,
+            budget_remaining_in_worst_case=budget_left,
+            repeated_source_checks=repeated_tuple,
+        )
+
+    def compare_verification_plans(self, *plan_ids: str) -> dict[str, Any]:
+        comparisons = []
+        for plan_id in plan_ids:
+            preview = self.preview_conditional_plan(str(plan_id))
+            worst_path = max(
+                preview.paths,
+                key=lambda path: (
+                    max((len(group) for group in path["indistinguishable_groups"]),
+                        default=0),
+                    len(path["retained_hypothesis_ids"]),
+                    path["total_cost"]),
+                default={"indistinguishable_groups": (), "retained_hypothesis_ids": (),
+                         "total_cost": 0.0})
+            comparisons.append({
+                "plan_id": str(plan_id),
+                "worst_case_indistinguishable_groups": worst_path[
+                    "indistinguishable_groups"],
+                "worst_case_retained_hypothesis_ids": worst_path[
+                    "retained_hypothesis_ids"],
+                "used_cost": 0.0,
+                "uncommitted_cost": preview.uncommitted_cost,
+                "worst_case_total_cost": worst_path["total_cost"],
+                "budget_remaining_in_worst_case": preview.budget_remaining_in_worst_case,
+            })
+        return {"plans": tuple(comparisons)}
+
+    def compare_plan_runs(self, *run_ids: str) -> dict[str, Any]:
+        comparisons = []
+        for run_id in run_ids:
+            run = self.plan_run(str(run_id))
+            preview = self.preview_conditional_plan(run.plan_id, run.run_id)
+            worst_path = max(
+                preview.paths,
+                key=lambda path: (
+                    max((len(group) for group in path["indistinguishable_groups"]),
+                        default=0),
+                    len(path["retained_hypothesis_ids"]),
+                    path["additional_cost"]),
+                default={"indistinguishable_groups": (), "retained_hypothesis_ids": (),
+                         "additional_cost": 0.0})
+            comparisons.append({
+                "plan_id": run.plan_id,
+                "run_id": run.run_id,
+                "status": run.status,
+                "worst_case_indistinguishable_groups": worst_path[
+                    "indistinguishable_groups"],
+                "worst_case_retained_hypothesis_ids": worst_path[
+                    "retained_hypothesis_ids"],
+                "used_cost": run.spent_cost,
+                "uncommitted_cost": preview.uncommitted_cost,
+                "budget_remaining_in_worst_case": preview.budget_remaining_in_worst_case,
+            })
+        return {"runs": tuple(comparisons)}
+
+    def _conditional_plan_paths(self, plan: VerificationPlan,
+                                run: PlanRun | None = None) -> list[dict[str, Any]]:
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        roots = tuple(sorted(check_id for check_id, parents in incoming.items()
+                             if not parents))
+        paths: list[dict[str, Any]] = []
+
+        def extend(prefix: list[tuple[str, str]], check_id: str) -> None:
+            check = by_id[check_id]
+            outcomes = [self._find_planned_outcome(
+                check, run.observed_outcomes[check_id])] \
+                if run is not None and check_id in run.observed_outcomes \
+                else list(check.outcomes)
+            for outcome in outcomes:
+                next_prefix = [*prefix, (check_id, outcome.outcome_id)]
+                next_ids = list(outcome.next_check_ids)
+                if next_ids:
+                    for next_id in next_ids:
+                        extend(next_prefix, next_id)
+                else:
+                    ordered_ids = tuple(check_id for check_id, _ in next_prefix)
+                    unique_ids = tuple(dict.fromkeys(ordered_ids))
+                    trial = self._trial_for_plan_sequence(plan, next_prefix)
+                    after = {h.hypothesis_id: h for h in trial.hypotheses(True)}
+                    retained = tuple(sorted(
+                        hid for hid in plan.hypothesis_ids
+                        if hid in after and not after[hid].is_retracted))
+                    excluded = tuple(sorted(set(plan.hypothesis_ids) - set(retained)))
+                    groups = self._indistinguishable_groups(
+                        [after[hid] for hid in retained])
+                    total_cost = sum(by_id[item].cost for item in unique_ids)
+                    completed_cost = sum(run.actual_costs.get(item, 0.0)
+                                         for item in unique_ids) if run else 0.0
+                    additional_cost = max(0.0, total_cost - completed_cost)
+                    spent = run.spent_cost if run is not None else 0.0
+                    paths.append({
+                        "outcome_sequence": tuple(next_prefix),
+                        "check_ids": unique_ids,
+                        "total_cost": total_cost,
+                        "additional_cost": additional_cost,
+                        "retained_hypothesis_ids": retained,
+                        "excluded_hypothesis_ids": excluded,
+                        "indistinguishable_groups": groups,
+                        "within_budget": plan.budget is None
+                        or spent + additional_cost <= plan.budget,
+                    })
+
+        for root in roots:
+            extend([], root)
+        return paths
+
+    def _trial_for_plan_sequence(self, plan: VerificationPlan,
+                                 sequence: list[tuple[str, str]]) -> "InvestigationStore":
+        trial = InvestigationStore.restore(copy.deepcopy(plan.baseline_snapshot))
+        seen: set[str] = set()
+        for check_id, outcome_id in sequence:
+            if check_id in seen:
+                continue
+            seen.add(check_id)
+            check = self._find_planned_check(plan, check_id)
+            outcome = self._find_planned_outcome(check, outcome_id)
+            records = [self._prospective_record(plan, check, outcome, record)
+                       for record in outcome.records]
+            existing = list(trial.snapshot().get("records", {})
+                            .get(check.source_id, ()))
+            trial.import_source(
+                check.source_id,
+                [*existing, *records],
+                description=f"prospective:{plan.plan_id}:{check_id}:{outcome_id}")
+        return trial
+
+    @staticmethod
+    def _plan_incoming(plan: VerificationPlan) -> dict[str, set[str]]:
+        incoming = {check.check_id: set() for check in plan.checks}
+        for check in plan.checks:
+            for outcome in check.outcomes:
+                for next_id in outcome.next_check_ids:
+                    incoming[next_id].add(check.check_id)
+        return incoming
+
+    def plan_runs(self) -> list[PlanRun]:
+        return [self._plan_runs[key] for key in sorted(self._plan_runs)]
+
+    def plan_run(self, run_id: str) -> PlanRun:
+        return self._plan_runs[str(run_id)]
+
+    def start_plan_run(
+        self, plan_id: str, run_id: str | None = None,
+        *,
+        available_materials: Iterable[str] = (),
+        note: str = "",
+    ) -> PlanRun:
+        plan = self.verification_plan(plan_id)
+        run_id = str(run_id or f"run-{plan.plan_id}-{len(self._plan_runs) + 1}")
+        if run_id in self._plan_runs:
+            raise ImportError(f"plan run {run_id!r} already exists")
+        run = PlanRun(
+            run_id=run_id,
+            plan_id=plan.plan_id,
+            available_materials=set(plan.available_materials)
+                | {str(item) for item in available_materials},
+            check_states={check.check_id: "pending" for check in plan.checks},
+        )
+        self._plan_runs[run_id] = run
+        self._append_run_event(run, "started", note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def start_plan_check(self, run_id: str, check_id: str,
+                         *, at_time: float | None = None,
+                         note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        check = self._find_planned_check(plan, check_id)
+        self._require_active_run(run)
+        self._refresh_plan_blockers(plan, run)
+        if run.check_states.get(check_id) != "available":
+            raise ImportError(
+                f"check {check_id!r} is {run.check_states.get(check_id)}, not available")
+        if at_time is not None:
+            if check.available_start is not None and at_time < check.available_start:
+                raise ImportError(f"check {check_id!r} is not available yet")
+            if check.available_end is not None and at_time > check.available_end:
+                raise ImportError(f"check {check_id!r} availability window has closed")
+        run.check_states[check_id] = "in_progress"
+        self._append_run_event(run, "check_started", check_id=check_id, note=note)
+        return run
+
+    def record_plan_check_result(
+        self, run_id: str, check_id: str, outcome_id: str,
+        *,
+        batch_id: str | None = None,
+        cost: float | None = None,
+        note: str = "",
+    ) -> PlanRun:
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        check = self._find_planned_check(plan, check_id)
+        self._require_active_run(run)
+        if run.check_states.get(check_id) != "in_progress":
+            raise ImportError(f"check {check_id!r} has not started")
+        actual_cost = check.cost if cost is None else float(cost)
+        if actual_cost < 0:
+            raise ImportError("actual check cost cannot be negative")
+        if plan.budget is not None and run.spent_cost + actual_cost > plan.budget:
+            run.status = "budget_exhausted"
+            run.check_states[check_id] = "uncommitted"
+            self._append_run_event(
+                run, "budget_exhausted", check_id=check_id,
+                cost=actual_cost, note=note)
+            return run
+        try:
+            outcome = self._find_planned_outcome(check, outcome_id)
+        except KeyError:
+            run.spent_cost += actual_cost
+            run.actual_costs[check_id] = actual_cost
+            run.check_states[check_id] = "out_of_range"
+            self._append_run_event(
+                run, "out_of_range", check_id=check_id, outcome_id=str(outcome_id),
+                cost=actual_cost, note=note)
+            self._refresh_plan_blockers(plan, run)
+            return run
+        run.spent_cost += actual_cost
+        run.actual_costs[check_id] = actual_cost
+        run.check_states[check_id] = "completed"
+        run.observed_outcomes[check_id] = outcome.outcome_id
+        if batch_id is not None:
+            run.evidence_batches[check_id] = str(batch_id)
+        self._append_run_event(
+            run, "result_recorded", check_id=check_id,
+            outcome_id=outcome.outcome_id, batch_id=batch_id,
+            cost=actual_cost, note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def add_plan_material(self, run_id: str, material_id: str,
+                          *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        run.available_materials |= {str(material_id)}
+        self._append_run_event(
+            run, "material_added", material_id=str(material_id), note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def withdraw_plan_material(self, run_id: str, material_id: str,
+                               *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        run.available_materials.discard(str(material_id))
+        if run.status == "active":
+            plan = self.verification_plan(run.plan_id)
+            for check in plan.checks:
+                if material_id in check.required_materials \
+                        and run.check_states.get(check.check_id) == "in_progress":
+                    run.check_states[check.check_id] = "blocked"
+                    self._append_run_event(
+                        run, "check_blocked", check_id=check.check_id,
+                        material_id=str(material_id),
+                        note="required material withdrawn")
+        self._append_run_event(
+            run, "material_withdrawn", material_id=str(material_id), note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def invalidate_plan_check(self, run_id: str, check_id: str,
+                              *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        if run.check_states.get(check_id) in {None, "pending", "blocked"}:
+            raise ImportError(f"check {check_id!r} has no executed basis to invalidate")
+        run.check_states[check_id] = "invalid"
+        self._append_run_event(run, "check_invalidated", check_id=check_id, note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def pause_plan_run(self, run_id: str, *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        run.status = "paused"
+        self._append_run_event(run, "paused", note=note)
+        return run
+
+    def resume_plan_run(self, run_id: str, *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        if run.status != "paused":
+            raise ImportError(f"plan run {run_id!r} is not paused")
+        run.status = "active"
+        plan = self.verification_plan(run.plan_id)
+        self._append_run_event(run, "resumed", note=note)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def terminate_plan_run(self, run_id: str, *, note: str = "") -> PlanRun:
+        run = self.plan_run(run_id)
+        run.status = "terminated"
+        for check_id, state in list(run.check_states.items()):
+            if state in {"pending", "available", "blocked", "waiting", "in_progress"}:
+                run.check_states[check_id] = "uncommitted"
+        self._append_run_event(run, "terminated", note=note)
+        return run
+
+    def revise_verification_plan(
+        self, plan_id: str, checks: Iterable[PlannedCheck | dict[str, Any]],
+        *,
+        seeds: Iterable[str] = (),
+        set_id: str | None = "__active__",
+        description: str = "",
+        budget: float | None = None,
+        available_materials: Iterable[str] = (),
+    ) -> VerificationPlan:
+        old = self.verification_plan(plan_id)
+        if any(run.plan_id == plan_id and run.status not in {"terminated"}
+               for run in self._plan_runs.values()):
+            raise ImportError("only a terminated plan can be replaced in place")
+        del self._verification_plans[plan_id]
+        try:
+            return self.create_verification_plan(
+                old.plan_id, checks, seeds=seeds, set_id=set_id,
+                description=description, budget=budget,
+                available_materials=available_materials)
+        except Exception:
+            self._verification_plans[old.plan_id] = old
+            raise
+
+    @staticmethod
+    def _require_active_run(run: PlanRun) -> None:
+        if run.status != "active":
+            raise ImportError(f"plan run {run.run_id!r} is {run.status}")
+
+    def _refresh_plan_blockers(self, plan: VerificationPlan, run: PlanRun) -> None:
+        if run.status in {"terminated", "budget_exhausted"}:
+            return
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        for check_id in sorted(by_id, key=lambda item: item):
+            state = run.check_states.get(check_id)
+            if state not in {"pending", "available", "blocked", "waiting"}:
+                continue
+            missing_materials = set(by_id[check_id].required_materials) \
+                - set(run.available_materials)
+            predecessor_states = {run.check_states.get(parent)
+                                  for parent in incoming[check_id]}
+            invalid_basis = predecessor_states & {
+                "invalid", "out_of_range", "uncommitted", "blocked"}
+            waiting_basis = predecessor_states - {
+                "completed", "invalid", "out_of_range", "uncommitted", "blocked"}
+            if invalid_basis:
+                run.check_states[check_id] = "blocked"
+            elif waiting_basis:
+                run.check_states[check_id] = "waiting"
+            elif missing_materials:
+                run.check_states[check_id] = "blocked"
+            elif run.status == "active":
+                run.check_states[check_id] = "available"
+
+    def _append_run_event(
+        self, run: PlanRun, action: str, *,
+        check_id: str | None = None, outcome_id: str | None = None,
+        material_id: str | None = None, batch_id: str | None = None,
+        cost: float = 0.0, note: str = "",
+    ) -> None:
+        run.events.append(PlanRunEvent(
+            event_id=f"event-{len(run.events) + 1}",
+            recorded_at=time.time(), action=action, check_id=check_id,
+            outcome_id=outcome_id, material_id=material_id,
+            batch_id=batch_id, cost=cost, note=note))
 
     def assess_plan_outcome(self, plan_id: str, check_id: str,
                             outcome_id: str) -> OutcomeAssessment:
@@ -1298,6 +1805,18 @@ class InvestigationStore:
         )
         self._evidence_decisions.append(decision)
         batch.status = "withdrawn"
+        for run in self._plan_runs.values():
+            if run.status in {"terminated", "budget_exhausted"}:
+                continue
+            for check_id, linked_batch_id in list(run.evidence_batches.items()):
+                if linked_batch_id != batch.batch_id:
+                    continue
+                run.check_states[check_id] = "invalid"
+                run_plan = self.verification_plan(run.plan_id)
+                self._append_run_event(
+                    run, "check_invalidated", check_id=check_id,
+                    batch_id=batch.batch_id, note=reason or "evidence withdrawn")
+                self._refresh_plan_blockers(run_plan, run)
         return decision
 
     def _accepted_record_ids(self, batch: ReceivedBatch) -> set[str]:
@@ -1591,7 +2110,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 4,
+            "version": 5,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -1645,6 +2164,7 @@ class InvestigationStore:
             "evidence_decisions": [
                 decision.as_dict() for decision in self._evidence_decisions
             ],
+            "plan_runs": [run.as_dict() for run in self.plan_runs()],
             "manual_judgments": [
                 {"link_id": judgment.link_id, "action": judgment.action,
                  "recorded_at": judgment.recorded_at, "note": judgment.note,
@@ -1678,7 +2198,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3, 4):
+        if data.get("version") not in (1, 2, 3, 4, 5):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -1777,4 +2297,7 @@ class InvestigationStore:
             store._received_batches[batch.batch_id] = batch
         for item in data.get("evidence_decisions", ()):
             store._evidence_decisions.append(EvidenceDecision.from_dict(item))
+        for item in data.get("plan_runs", ()):
+            run = PlanRun.from_dict(item)
+            store._plan_runs[run.run_id] = run
         return store

@@ -185,6 +185,7 @@ class PlannedOutcome:
     label: str
     records: tuple[dict[str, Any], ...] = ()
     note: str = ""
+    next_check_ids: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -192,6 +193,7 @@ class PlannedOutcome:
             "label": self.label,
             "records": [dict(record) for record in self.records],
             "note": self.note,
+            "next_check_ids": list(self.next_check_ids),
         }
 
     @classmethod
@@ -201,6 +203,8 @@ class PlannedOutcome:
             label=str(data.get("label", data["outcome_id"])),
             records=tuple(dict(record) for record in data.get("records", ())),
             note=str(data.get("note", "")),
+            next_check_ids=tuple(str(item)
+                                 for item in data.get("next_check_ids", ())),
         )
 
 
@@ -215,6 +219,10 @@ class PlannedCheck:
     target: str | None = None
     direction: str = "incoming"
     outcomes: tuple[PlannedOutcome, ...] = ()
+    cost: float = 0.0
+    available_start: float | None = None
+    available_end: float | None = None
+    required_materials: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +233,10 @@ class PlannedCheck:
             "target": self.target,
             "direction": self.direction,
             "outcomes": [outcome.as_dict() for outcome in self.outcomes],
+            "cost": self.cost,
+            "available_start": self.available_start,
+            "available_end": self.available_end,
+            "required_materials": list(self.required_materials),
         }
 
     @classmethod
@@ -238,6 +250,11 @@ class PlannedCheck:
             direction=str(data.get("direction", "incoming")),
             outcomes=tuple(PlannedOutcome.from_dict(item)
                            for item in data.get("outcomes", ())),
+            cost=float(data.get("cost", 0.0)),
+            available_start=data.get("available_start"),
+            available_end=data.get("available_end"),
+            required_materials=tuple(str(item)
+                                     for item in data.get("required_materials", ())),
         )
 
 
@@ -253,6 +270,8 @@ class VerificationPlan:
     seeds: tuple[str, ...] = ()
     description: str = ""
     baseline_snapshot: dict[str, Any] = field(default_factory=dict)
+    budget: float | None = None
+    available_materials: frozenset[str] = frozenset()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -264,6 +283,8 @@ class VerificationPlan:
             "seeds": list(self.seeds),
             "description": self.description,
             "baseline_snapshot": self.baseline_snapshot,
+            "budget": self.budget,
+            "available_materials": sorted(self.available_materials),
         }
 
     @classmethod
@@ -278,6 +299,96 @@ class VerificationPlan:
             seeds=tuple(data.get("seeds", ())),
             description=str(data.get("description", "")),
             baseline_snapshot=dict(data.get("baseline_snapshot", {})),
+            budget=data.get("budget"),
+            available_materials=frozenset(data.get("available_materials", ())),
+        )
+
+
+@dataclass
+class PlanRunEvent:
+    event_id: str
+    recorded_at: float | None
+    action: str
+    check_id: str | None = None
+    outcome_id: str | None = None
+    material_id: str | None = None
+    batch_id: str | None = None
+    cost: float = 0.0
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "recorded_at": self.recorded_at,
+            "action": self.action,
+            "check_id": self.check_id,
+            "outcome_id": self.outcome_id,
+            "material_id": self.material_id,
+            "batch_id": self.batch_id,
+            "cost": self.cost,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlanRunEvent":
+        return cls(
+            event_id=str(data["event_id"]),
+            recorded_at=data.get("recorded_at"),
+            action=str(data["action"]),
+            check_id=data.get("check_id"),
+            outcome_id=data.get("outcome_id"),
+            material_id=data.get("material_id"),
+            batch_id=data.get("batch_id"),
+            cost=float(data.get("cost", 0.0)),
+            note=str(data.get("note", "")),
+        )
+
+
+@dataclass
+class PlanRun:
+    run_id: str
+    plan_id: str
+    status: str = "active"
+    spent_cost: float = 0.0
+    available_materials: frozenset[str] = frozenset()
+    check_states: dict[str, str] = field(default_factory=dict)
+    observed_outcomes: dict[str, str] = field(default_factory=dict)
+    evidence_batches: dict[str, str] = field(default_factory=dict)
+    actual_costs: dict[str, float] = field(default_factory=dict)
+    events: list[PlanRunEvent] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "status": self.status,
+            "spent_cost": self.spent_cost,
+            "available_materials": sorted(self.available_materials),
+            "check_states": dict(self.check_states),
+            "observed_outcomes": dict(self.observed_outcomes),
+            "evidence_batches": dict(self.evidence_batches),
+            "actual_costs": dict(self.actual_costs),
+            "events": [event.as_dict() for event in self.events],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlanRun":
+        return cls(
+            run_id=str(data["run_id"]),
+            plan_id=str(data["plan_id"]),
+            status=str(data.get("status", "active")),
+            spent_cost=float(data.get("spent_cost", 0.0)),
+            available_materials=frozenset(data.get("available_materials", ())),
+            check_states={str(k): str(v)
+                          for k, v in data.get("check_states", {}).items()},
+            observed_outcomes={str(k): str(v)
+                              for k, v in data.get("observed_outcomes", {}).items()},
+            evidence_batches={str(k): str(v)
+                              for k, v in data.get("evidence_batches", {}).items()},
+            actual_costs={str(k): float(v)
+                          for k, v in data.get("actual_costs", {}).items()},
+            events=[PlanRunEvent.from_dict(item)
+                    for item in data.get("events", ())],
         )
 
 

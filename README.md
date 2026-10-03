@@ -57,6 +57,12 @@
   `accept_evidence(..., record_ids=...)` 决定采纳范围，或 `reject_evidence(...)`。
 - **撤回可追查**：`withdraw_evidence(...)` 会从当前事实图移除后来证据并重算，
   但接受、排除原因、撤回等 `evidence_decisions()` 审计记录继续保留。
+- **条件分支与预算**：每个可能结果可用 `next_check_ids` 指向后续核查；
+  核查可声明 `cost`、`available_start/end`、`required_materials`。共同前缀只
+  在实际路径中计费一次，互斥分支按路径展示最坏未决假设组和未承诺成本。
+- **执行可暂停恢复**：`start_plan_run(...)`、`start_plan_check(...)`、
+  `record_plan_check_result(...)` 保留已发生成本和事件；越界结果进入
+  `out_of_range`，材料撤回或证据撤回会阻断依赖项，不会跳到“最接近”的分支。
 
 ## 记录格式
 
@@ -156,6 +162,23 @@ preview.retained_paths
 
 # 另一个可能结果的独立研究；不影响当前 store
 branch = store.open_plan_outcome("round-1", "check-parent", "supports-b")
+
+conditional = store.create_verification_plan("round-2", [{"check_id": "common", ...,
+    "cost": 4, "required_materials": ["image"],
+    "outcomes": [
+        {"outcome_id": "supports-a", "next_check_ids": ["check-a"]},
+        {"outcome_id": "supports-b", "next_check_ids": ["check-b"]},
+    ]}], budget=12, available_materials=["image"])
+preview = store.preview_conditional_plan("round-2")
+preview.paths                    # 每条互斥路径的成本/仍无法区分假设组
+preview.common_cost             # 共同前缀成本，只计一次
+preview.uncommitted_cost         # 最坏情况下仍需承诺的费用
+run = store.start_plan_run("round-2", "run-1")
+store.start_plan_check("run-1", "common")
+store.record_plan_check_result("run-1", "common", "supports-a")
+store.pause_plan_run("run-1")
+store.resume_plan_run("run-1")
+store.compare_plan_runs("run-1")
 
 batch_id = store.receive_evidence(
     "memory-team", incoming_records,
