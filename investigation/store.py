@@ -4,16 +4,19 @@ import copy
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 from .models import (
     MANUAL_SOURCE,
+    CheckResult,
     Edge,
     Event,
     EventKind,
     Hypothesis,
     EvidenceDecision,
     ManualLink,
+    PlanRun,
     PlannedCheck,
     PendingRef,
     ReceivedBatch,
@@ -122,6 +125,78 @@ class OutcomeAssessment:
     prospective: bool = True
 
 
+@dataclass(frozen=True)
+class PreviewPath:
+    """One realizable outcome path through a conditional plan.
+
+    cost sums each check on the path exactly once, so a shared prefix
+    is never charged twice; mutually exclusive branches appear as
+    separate paths with their own totals.
+    """
+
+    steps: tuple[tuple[str, str], ...]  # (check_id, outcome_id) per step
+    cost: float
+    indistinguishable_groups: tuple[tuple[str, ...], ...]
+    retained_hypothesis_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlanPreview:
+    """Prospective walk of a plan; nothing here is observed fact."""
+
+    plan_id: str
+    budget: float | None
+    paths: tuple[PreviewPath, ...]
+    shared_sources: tuple[str, ...]
+    worst_case_groups: tuple[tuple[str, ...], ...]
+    max_path_cost: float
+    over_budget_paths: tuple[tuple[str, str], ...]
+    prospective: bool = True
+
+
+@dataclass(frozen=True)
+class PlanStatus:
+    """Live execution view of a plan.
+
+    startable checks may begin independently right now; waiting checks
+    must wait for pending predecessor results; invalidated checks
+    depended on prerequisite material or outcome bases that are no
+    longer in force and are stopped rather than silently rerouted.
+    """
+
+    plan_id: str
+    state: str  # active | completed | terminated
+    confirmed: bool
+    budget: float | None
+    spent: float
+    remaining_budget: float | None
+    results: tuple[CheckResult, ...]
+    startable: tuple[str, ...]
+    waiting: tuple[str, ...]
+    invalidated: tuple[str, ...]
+    terminated: tuple[str, ...]
+    unexpected: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PlanComparisonEntry:
+    plan_id: str
+    worst_case_groups: tuple[tuple[str, ...], ...]
+    committed_cost: float
+    uncommitted_cost: float
+    budget: float | None
+
+
+@dataclass(frozen=True)
+class PlanComparison:
+    """Side-by-side plan facts; deliberately no ranking verdict."""
+
+    entries: tuple[PlanComparisonEntry, ...]
+    note: str = (
+        "comparison reports worst-case indistinguishable groups and cost "
+        "split only; expected exclusion counts alone do not rank plans")
+
+
 class InvestigationStore:
     """In-memory evidence graph, rebuilt deterministically from raw records.
 
@@ -157,6 +232,7 @@ class InvestigationStore:
         self._verification_plans: dict[str, VerificationPlan] = {}
         self._received_batches: dict[str, ReceivedBatch] = {}
         self._evidence_decisions: list[EvidenceDecision] = []
+        self._plan_runs: dict[str, PlanRun] = {}
 
     # ---------------------------------------------------------------- import
 
@@ -876,6 +952,7 @@ class InvestigationStore:
         seeds: Iterable[str] = (),
         set_id: str | None = "__active__",
         description: str = "",
+        budget: float | None = None,
     ) -> VerificationPlan:
         if not plan_id or not isinstance(plan_id, str):
             raise ImportError("plan_id must be a non-empty string")
@@ -901,13 +978,18 @@ class InvestigationStore:
             hypothesis_ids=frozenset(self._hypotheses),
             seeds=tuple(seed_list),
             description=description,
+            budget=None if budget is None else float(budget),
             baseline_snapshot=copy.deepcopy(self.snapshot()),
         )
         self._verification_plans[plan_id] = plan
+        self._plan_runs.setdefault(plan_id, PlanRun(plan_id=plan_id))
         return plan
 
     @staticmethod
-    def _validate_planned_checks(checks: tuple[PlannedCheck, ...]) -> None:
+    def _validate_planned_checks(
+        checks: tuple[PlannedCheck, ...],
+        allow_dangling_from: frozenset[str] = frozenset(),
+    ) -> None:
         check_ids = [check.check_id for check in checks]
         if len(check_ids) != len(set(check_ids)):
             raise ImportError("check_id values must be unique within a plan")
@@ -919,6 +1001,46 @@ class InvestigationStore:
             if len(outcome_ids) != len(set(outcome_ids)):
                 raise ImportError(
                     f"outcome ids in check {check.check_id!r} must be unique")
+            if check.cost < 0:
+                raise ImportError(
+                    f"check {check.check_id!r} has a negative cost")
+            if (check.available_start is not None
+                    and check.available_end is not None
+                    and check.available_start > check.available_end):
+                raise ImportError(
+                    f"check {check.check_id!r} has an inverted time window")
+            for outcome in check.outcomes:
+                for nxt in outcome.next_checks:
+                    if nxt not in check_ids:
+                        if check.check_id in allow_dangling_from:
+                            continue
+                        raise ImportError(
+                            f"outcome {outcome.outcome_id!r} of check "
+                            f"{check.check_id!r} continues to unknown check "
+                            f"{nxt!r}")
+        InvestigationStore._validate_acyclic(checks)
+
+    @staticmethod
+    def _validate_acyclic(checks: tuple[PlannedCheck, ...]) -> None:
+        graph = {check.check_id: [nxt for outcome in check.outcomes
+                                  for nxt in outcome.next_checks]
+                 for check in checks}
+        visiting: set[str] = set()
+        done: set[str] = set()
+
+        def walk(node: str) -> None:
+            if node in done:
+                return
+            if node in visiting:
+                raise ImportError("conditional plan contains a cycle")
+            visiting.add(node)
+            for nxt in graph.get(node, ()):
+                walk(nxt)
+            visiting.discard(node)
+            done.add(node)
+
+        for check_id in graph:
+            walk(check_id)
 
     @staticmethod
     def _planned_check_from_dict(data: dict[str, Any]) -> PlannedCheck:
@@ -938,8 +1060,14 @@ class InvestigationStore:
                     records=tuple(dict(record)
                                   for record in item.get("records", ())),
                     note=str(item.get("note", "")),
+                    next_checks=tuple(str(nxt)
+                                      for nxt in item.get("next_checks", ())),
                 )
                 for item in data.get("outcomes", ())),
+            cost=float(data.get("cost", 0.0)),
+            available_start=data.get("available_start"),
+            available_end=data.get("available_end"),
+            requires=tuple(str(req) for req in data.get("requires", ())),
         )
 
     def verification_plans(self) -> list[VerificationPlan]:
@@ -1064,6 +1192,299 @@ class InvestigationStore:
             and after.active_claims != before.active_claims)
 
     # ------------------------------------------------ received evidence flow
+    # -------------------------------------------- conditional plan execution
+
+    def plan_run(self, plan_id: str) -> PlanRun:
+        self.verification_plan(plan_id)
+        return self._plan_runs.setdefault(plan_id, PlanRun(plan_id=plan_id))
+
+    def plan_runs(self) -> list[PlanRun]:
+        return [self._plan_runs[key] for key in sorted(self._plan_runs)]
+
+    @staticmethod
+    def _plan_roots(plan: VerificationPlan) -> list[PlannedCheck]:
+        referenced = {nxt for check in plan.checks
+                      for outcome in check.outcomes
+                      for nxt in outcome.next_checks}
+        return [check for check in plan.checks
+                if check.check_id not in referenced]
+
+    def preview_plan(self, plan_id: str) -> PlanPreview:
+        """Walk every realizable outcome path without treating any
+        expected outcome as fact; shared prefixes are charged once per
+        path and mutually exclusive branches are shown separately."""
+        plan = self.verification_plan(plan_id)
+        raw_paths: list[list[tuple[str, str]]] = []
+
+        def walk(check: PlannedCheck,
+                 prefix: list[tuple[str, str]]) -> None:
+            for outcome in check.outcomes:
+                steps = [*prefix, (check.check_id, outcome.outcome_id)]
+                followers = [self._find_planned_check(plan, nxt)
+                             for nxt in outcome.next_checks]
+                if not followers:
+                    raw_paths.append(steps)
+                else:
+                    for follower in followers:
+                        walk(follower, steps)
+
+        for root in self._plan_roots(plan):
+            walk(root, [])
+        paths: list[PreviewPath] = []
+        for steps in raw_paths:
+            groups, retained = self._assess_path(plan, steps)
+            by_id = {check.check_id: check for check in plan.checks}
+            cost = sum(by_id[check_id].cost
+                       for check_id in dict.fromkeys(
+                           check_id for check_id, _ in steps))
+            paths.append(PreviewPath(
+                steps=tuple(steps), cost=cost,
+                indistinguishable_groups=groups,
+                retained_hypothesis_ids=retained))
+        source_use: dict[str, int] = {}
+        for check in plan.checks:
+            source_use[check.source_id] = source_use.get(check.source_id, 0) + 1
+        shared = tuple(sorted(source for source, count in source_use.items()
+                              if count > 1))
+        worst: tuple[tuple[str, ...], ...] = ()
+        if paths:
+            worst = max(paths,
+                        key=lambda path: len(path.indistinguishable_groups)
+                        ).indistinguishable_groups
+        max_cost = max((path.cost for path in paths), default=0.0)
+        over_budget: tuple[tuple[str, str], ...] = ()
+        if plan.budget is not None:
+            over_budget = tuple(
+                step for path in paths if path.cost > plan.budget
+                for step in path.steps)
+        return PlanPreview(
+            plan_id=plan.plan_id, budget=plan.budget, paths=tuple(paths),
+            shared_sources=shared, worst_case_groups=worst,
+            max_path_cost=max_cost, over_budget_paths=over_budget)
+
+    def _assess_path(
+        self, plan: VerificationPlan, steps: list[tuple[str, str]],
+    ) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+        trial = InvestigationStore.restore(
+            copy.deepcopy(plan.baseline_snapshot))
+        by_id = {check.check_id: check for check in plan.checks}
+        for check_id, outcome_id in steps:
+            check = by_id[check_id]
+            outcome = self._find_planned_outcome(check, outcome_id)
+            records = [self._prospective_record(plan, check, outcome, record)
+                       for record in outcome.records]
+            if records:
+                existing = list(trial._records.get(check.source_id, {}).values())
+                trial.import_source(
+                    check.source_id, [*existing, *records],
+                    description=f"prospective:{plan.plan_id}:{check_id}:"
+                                f"{outcome.outcome_id}")
+        baseline_ids = set(plan.hypothesis_ids)
+        after = {hypothesis.hypothesis_id: hypothesis
+                 for hypothesis in trial.hypotheses(True)}
+        retained = tuple(sorted(
+            hid for hid in baseline_ids
+            if hid in after and not after[hid].is_retracted))
+        groups = self._indistinguishable_groups(
+            [after[hid] for hid in retained])
+        return groups, retained
+
+    def record_check_result(
+        self, plan_id: str, check_id: str, outcome_id: str | None = None,
+        *,
+        batch_id: str | None = None,
+        note: str = "",
+    ) -> CheckResult:
+        """Record an actually observed result; cost is charged once.
+
+        An outcome outside the preset outcomes (or None) is recorded as
+        unexpected: the spend stays on the books and dependent checks are
+        stopped instead of being silently rerouted to the nearest branch.
+        """
+        plan = self.verification_plan(plan_id)
+        run = self.plan_run(plan_id)
+        if run.state == "terminated":
+            raise ImportError(f"plan {plan_id!r} is terminated")
+        check = self._find_planned_check(plan, check_id)
+        if check.check_id in run.terminated_checks:
+            raise ImportError(f"check {check_id!r} is terminated")
+        if any(result.check_id == check.check_id for result in run.results):
+            raise ImportError(
+                f"check {check_id!r} already has a recorded result")
+        status = self.plan_status(plan_id)
+        if check.check_id not in status.startable:
+            raise ImportError(
+                f"check {check_id!r} is not startable now; it must wait "
+                "for predecessor results or is invalidated")
+        if batch_id is not None:
+            self.received_batch(batch_id)
+        expected = outcome_id is not None and any(
+            outcome.outcome_id == outcome_id for outcome in check.outcomes)
+        result = CheckResult(
+            plan_id=plan.plan_id, check_id=check.check_id,
+            outcome_id=outcome_id, expected=expected, cost=check.cost,
+            recorded_at=time.time(), batch_id=batch_id, note=note)
+        run.results.append(result)
+        return result
+
+    def _result_basis_valid(self, result: CheckResult) -> bool:
+        if result.batch_id is None:
+            return True
+        batch = self._received_batches.get(result.batch_id)
+        return batch is not None and batch.status != "withdrawn"
+
+    def _required_material_available(self, check: PlannedCheck) -> bool:
+        return all(self._records.get(required)
+                   for required in check.requires)
+
+    def plan_status(self, plan_id: str) -> PlanStatus:
+        plan = self.verification_plan(plan_id)
+        run = self.plan_run(plan_id)
+        spent = sum(result.cost for result in run.results)
+        executed = {result.check_id for result in run.results}
+        by_id = {check.check_id: check for check in plan.checks}
+        valid_results = [result for result in run.results
+                         if result.expected
+                         and self._result_basis_valid(result)]
+        enabled = {check.check_id for check in self._plan_roots(plan)}
+        for result in valid_results:
+            check = by_id[result.check_id]
+            outcome = self._find_planned_outcome(check, result.outcome_id)
+            enabled.update(outcome.next_checks)
+        blocked: set[str] = set()
+        for result in run.results:
+            check = by_id[result.check_id]
+            if not result.expected:
+                for outcome in check.outcomes:
+                    blocked.update(outcome.next_checks)
+            elif not self._result_basis_valid(result):
+                outcome = self._find_planned_outcome(check, result.outcome_id)
+                blocked.update(outcome.next_checks)
+        startable: list[str] = []
+        waiting: list[str] = []
+        invalidated: list[str] = []
+        for check in plan.checks:
+            if check.check_id in executed \
+                    or check.check_id in run.terminated_checks:
+                continue
+            if not self._required_material_available(check):
+                invalidated.append(check.check_id)
+            elif check.check_id in blocked \
+                    and check.check_id not in enabled:
+                invalidated.append(check.check_id)
+            elif check.check_id in enabled:
+                startable.append(check.check_id)
+            else:
+                waiting.append(check.check_id)
+        if run.state == "terminated":
+            state = "terminated"
+        elif all(check.check_id in executed
+                 or check.check_id in run.terminated_checks
+                 for check in plan.checks):
+            state = "completed"
+        else:
+            state = "active"
+        remaining = None if plan.budget is None else plan.budget - spent
+        return PlanStatus(
+            plan_id=plan.plan_id, state=state, confirmed=run.confirmed,
+            budget=plan.budget, spent=spent, remaining_budget=remaining,
+            results=tuple(run.results),
+            startable=tuple(sorted(startable)),
+            waiting=tuple(sorted(waiting)),
+            invalidated=tuple(sorted(invalidated)),
+            terminated=tuple(sorted(run.terminated_checks)),
+            unexpected=tuple(sorted(
+                result.check_id for result in run.results
+                if not result.expected)))
+
+    def confirm_plan(self, plan_id: str) -> PlanStatus:
+        """Analyst confirms continuation after reviewing results."""
+        run = self.plan_run(plan_id)
+        if run.state == "terminated":
+            raise ImportError(f"plan {plan_id!r} is terminated")
+        run.confirmed = True
+        return self.plan_status(plan_id)
+
+    def revise_plan(
+        self, plan_id: str, checks: Iterable[PlannedCheck | dict[str, Any]],
+    ) -> VerificationPlan:
+        """Replace the unexecuted part of a plan; executed and terminated
+        checks are kept exactly as recorded."""
+        plan = self.verification_plan(plan_id)
+        run = self.plan_run(plan_id)
+        if run.state == "terminated":
+            raise ImportError(f"plan {plan_id!r} is terminated")
+        proposed = tuple(
+            check if isinstance(check, PlannedCheck)
+            else self._planned_check_from_dict(check)
+            for check in checks)
+        proposed_by_id = {check.check_id: check for check in proposed}
+        frozen = {result.check_id for result in run.results} \
+            | run.terminated_checks
+        missing = frozen - set(proposed_by_id)
+        if missing:
+            raise ImportError(
+                f"revision drops executed/terminated checks: {sorted(missing)}")
+        kept = {check.check_id: check for check in plan.checks
+                if check.check_id in frozen}
+        merged = tuple(proposed_by_id.get(check.check_id, check)
+                       if check.check_id not in kept else kept[check.check_id]
+                       for check in proposed)
+        if not merged:
+            raise ImportError("a verification plan requires at least one check")
+        merged_ids = {check.check_id for check in merged}
+        pruned: list[PlannedCheck] = []
+        for check in merged:
+            if check.check_id in frozen:
+                pruned.append(check)
+                continue
+            pruned.append(replace(check, outcomes=tuple(
+                replace(outcome, next_checks=tuple(
+                    nxt for nxt in outcome.next_checks if nxt in merged_ids))
+                for outcome in check.outcomes)))
+        merged = tuple(pruned)
+        self._validate_planned_checks(merged, allow_dangling_from=frozenset(frozen))
+        plan.checks = merged
+        return plan
+
+    def terminate_plan(
+        self, plan_id: str, check_ids: Iterable[str] | None = None,
+    ) -> PlanStatus:
+        """Stop remaining checks; recorded results and spend are kept."""
+        plan = self.verification_plan(plan_id)
+        run = self.plan_run(plan_id)
+        executed = {result.check_id for result in run.results}
+        known = {check.check_id for check in plan.checks}
+        if check_ids is None:
+            targets = known - executed
+        else:
+            targets = {str(check_id) for check_id in check_ids}
+            unknown = targets - known
+            if unknown:
+                raise KeyError(f"unknown planned checks: {sorted(unknown)}")
+            if targets & executed:
+                raise ImportError(
+                    "cannot terminate a check that already ran")
+        run.terminated_checks.update(targets)
+        if not (known - executed - run.terminated_checks):
+            run.state = "terminated"
+        return self.plan_status(plan_id)
+
+    def compare_plans(self, plan_id_a: str, plan_id_b: str) -> PlanComparison:
+        """Report worst-case indistinguishable groups plus committed and
+        uncommitted cost for each plan, without ranking them."""
+        entries: list[PlanComparisonEntry] = []
+        for plan_id in (plan_id_a, plan_id_b):
+            preview = self.preview_plan(plan_id)
+            status = self.plan_status(plan_id)
+            entries.append(PlanComparisonEntry(
+                plan_id=plan_id,
+                worst_case_groups=preview.worst_case_groups,
+                committed_cost=status.spent,
+                uncommitted_cost=max(0.0, preview.max_path_cost - status.spent),
+                budget=preview.budget))
+        return PlanComparison(entries=tuple(entries))
+
 
     def receive_evidence(
         self, source_id: str, records: Iterable[dict[str, Any]],
@@ -1591,7 +2012,8 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 4,
+            "version": 5,
+            "plan_runs": [run.as_dict() for run in self.plan_runs()],
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -1678,7 +2100,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3, 4):
+        if data.get("version") not in (1, 2, 3, 4, 5):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -1777,4 +2199,7 @@ class InvestigationStore:
             store._received_batches[batch.batch_id] = batch
         for item in data.get("evidence_decisions", ()):
             store._evidence_decisions.append(EvidenceDecision.from_dict(item))
+        for item in data.get("plan_runs", ()):
+            run = PlanRun.from_dict(item)
+            store._plan_runs[run.plan_id] = run
         return store

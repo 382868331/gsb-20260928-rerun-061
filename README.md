@@ -58,6 +58,36 @@
 - **撤回可追查**：`withdraw_evidence(...)` 会从当前事实图移除后来证据并重算，
   但接受、排除原因、撤回等 `evidence_decisions()` 审计记录继续保留。
 
+## 第三轮：有限预算下的条件调查计划
+
+- **计划随结果分支**：核查可声明 `cost`、`available_start`/`available_end`
+  （可开展时段）与 `requires`（前置材料来源）；每个预设结果用
+  `next_checks` 声明拿到该结果后继续哪项核查。`create_verification_plan(
+  ..., budget=...)` 记录本轮预算，条件链必须无环。
+- **预览不是事实**：`preview_plan(plan_id)` 在私有试算中枚举每条可发生
+  路径：共同前缀的核查在每条路径内只计一次成本，互斥分支按各自路径
+  展示费用；`shared_sources` 标出在多个分支重复询问的同一来源（不算
+  独立证据）；`worst_case_groups` 给出最坏情况下仍无法区分的假设组，
+  `over_budget_paths` 标出超预算路径。预览不改动真实调查。
+- **等待与独立开始**：`plan_status(plan_id)` 区分 `startable`（现在可
+  独立开始）、`waiting`（必须等待前置结果）、`invalidated`（前置材料
+  被撤回或所依赖结果失效，已停止而非悄悄改道）。`spent` 与
+  `remaining_budget` 实时反映已承诺成本。
+- **结果如实记录**：`record_check_result(...)` 每项核查只记一次、只扣
+  一次成本。实际结果不在预设范围内时记为 unexpected：支出保留、依赖
+  该结果的后续核查停止，不会自动转到最接近的分支。结果所依据的批次
+  被 `withdraw_evidence` 撤回后，依赖它的后续核查同样停止，已发生的
+  核查记录与支出继续保留。
+- **人工掌控**：`confirm_plan` 确认继续；`revise_plan` 只替换未执行的
+  核查（已执行/已终止的保持原样，悬空的分支引用被剪除）；
+  `terminate_plan` 终止全部或指定剩余核查，记录与支出不清零。
+- **计划对比不下判词**：`compare_plans(a, b)` 并列展示各自最坏情况下
+  尚不能区分的组、已用成本（committed）与未承诺成本（uncommitted），
+  不凭预计排除数量判定哪个计划必然更好。
+- **中途保存可恢复**：计划执行状态随快照（version 5）保存；恢复后证据
+  的采纳/撤回审计仍可追溯。`open_plan_outcome(...)` 的另一种假设结果
+  研究在独立副本上进行，不改变真实调查。
+
 ## 记录格式
 
 ```python
@@ -180,6 +210,9 @@ store.evidence_decisions()
   快照等首轮场景测试
 - `tests/test_hypotheses.py`：冲突父关系/重复 PID/迟到父事件、来源更正、
   人工关联撤销、增量路径失效、归档重开与对比
+- `tests/test_conditional_plans.py`：条件计划预览（前缀成本、互斥分支、
+  共享来源）、等待/可开始/失效状态、预算与超支路径、意外结果止损、
+  前置材料撤回、确认/修改/终止、计划对比、中途快照恢复、分支隔离
 
 ## 运行测试
 
@@ -187,4 +220,5 @@ store.evidence_decisions()
 python3 -m pytest tests/ -q
 PYTHONPATH=. python3 examples/demo.py
 PYTHONPATH=. python3 examples/demo_hypotheses.py
+PYTHONPATH=. python3 examples/demo_conditional.py
 ```

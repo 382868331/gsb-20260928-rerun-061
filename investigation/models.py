@@ -185,6 +185,7 @@ class PlannedOutcome:
     label: str
     records: tuple[dict[str, Any], ...] = ()
     note: str = ""
+    next_checks: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -192,6 +193,7 @@ class PlannedOutcome:
             "label": self.label,
             "records": [dict(record) for record in self.records],
             "note": self.note,
+            "next_checks": list(self.next_checks),
         }
 
     @classmethod
@@ -201,6 +203,7 @@ class PlannedOutcome:
             label=str(data.get("label", data["outcome_id"])),
             records=tuple(dict(record) for record in data.get("records", ())),
             note=str(data.get("note", "")),
+            next_checks=tuple(str(item) for item in data.get("next_checks", ())),
         )
 
 
@@ -215,6 +218,10 @@ class PlannedCheck:
     target: str | None = None
     direction: str = "incoming"
     outcomes: tuple[PlannedOutcome, ...] = ()
+    cost: float = 0.0
+    available_start: float | None = None
+    available_end: float | None = None
+    requires: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +232,10 @@ class PlannedCheck:
             "target": self.target,
             "direction": self.direction,
             "outcomes": [outcome.as_dict() for outcome in self.outcomes],
+            "cost": self.cost,
+            "available_start": self.available_start,
+            "available_end": self.available_end,
+            "requires": list(self.requires),
         }
 
     @classmethod
@@ -238,6 +249,10 @@ class PlannedCheck:
             direction=str(data.get("direction", "incoming")),
             outcomes=tuple(PlannedOutcome.from_dict(item)
                            for item in data.get("outcomes", ())),
+            cost=float(data.get("cost", 0.0)),
+            available_start=data.get("available_start"),
+            available_end=data.get("available_end"),
+            requires=tuple(str(item) for item in data.get("requires", ())),
         )
 
 
@@ -252,6 +267,7 @@ class VerificationPlan:
     hypothesis_ids: frozenset[str]
     seeds: tuple[str, ...] = ()
     description: str = ""
+    budget: float | None = None
     baseline_snapshot: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -263,6 +279,7 @@ class VerificationPlan:
             "hypothesis_ids": sorted(self.hypothesis_ids),
             "seeds": list(self.seeds),
             "description": self.description,
+            "budget": self.budget,
             "baseline_snapshot": self.baseline_snapshot,
         }
 
@@ -277,7 +294,83 @@ class VerificationPlan:
             hypothesis_ids=frozenset(data.get("hypothesis_ids", ())),
             seeds=tuple(data.get("seeds", ())),
             description=str(data.get("description", "")),
+            budget=data.get("budget"),
             baseline_snapshot=dict(data.get("baseline_snapshot", {})),
+        )
+
+
+@dataclass
+class CheckResult:
+    """An actually observed result of one planned check.
+
+    Results are append-only: once a check has run, its record and its cost
+    stay on the books even when the outcome falls outside the preset
+    outcomes or its evidentiary basis is later withdrawn.
+    """
+
+    plan_id: str
+    check_id: str
+    outcome_id: str | None
+    expected: bool
+    cost: float
+    recorded_at: float | None
+    batch_id: str | None = None
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "check_id": self.check_id,
+            "outcome_id": self.outcome_id,
+            "expected": self.expected,
+            "cost": self.cost,
+            "recorded_at": self.recorded_at,
+            "batch_id": self.batch_id,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CheckResult":
+        return cls(
+            plan_id=str(data["plan_id"]),
+            check_id=str(data["check_id"]),
+            outcome_id=data.get("outcome_id"),
+            expected=bool(data.get("expected", True)),
+            cost=float(data.get("cost", 0.0)),
+            recorded_at=data.get("recorded_at"),
+            batch_id=data.get("batch_id"),
+            note=str(data.get("note", "")),
+        )
+
+
+@dataclass
+class PlanRun:
+    """Execution state of one verification plan."""
+
+    plan_id: str
+    results: list[CheckResult] = field(default_factory=list)
+    terminated_checks: set[str] = field(default_factory=set)
+    state: str = "active"  # active | terminated
+    confirmed: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "results": [result.as_dict() for result in self.results],
+            "terminated_checks": sorted(self.terminated_checks),
+            "state": self.state,
+            "confirmed": self.confirmed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PlanRun":
+        return cls(
+            plan_id=str(data["plan_id"]),
+            results=[CheckResult.from_dict(item)
+                     for item in data.get("results", ())],
+            terminated_checks=set(data.get("terminated_checks", ())),
+            state=str(data.get("state", "active")),
+            confirmed=bool(data.get("confirmed", False)),
         )
 
 
