@@ -136,6 +136,7 @@ class ConditionalPlanPreview:
     uncommitted_cost: float
     budget_remaining_in_worst_case: float | None
     repeated_source_checks: tuple[tuple[str, tuple[str, ...]], ...]
+    off_path: tuple[tuple[str, str, float], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +153,10 @@ class ConditionalPlanPreview:
             "repeated_source_checks": [
                 {"source_id": sid, "check_ids": list(check_ids)}
                 for sid, check_ids in self.repeated_source_checks],
+            "off_path": [
+                {"check_id": check_id, "reason": reason,
+                 "sunk_cost": sunk_cost}
+                for check_id, reason, sunk_cost in self.off_path],
         }
 
 
@@ -1085,6 +1090,12 @@ class InvestigationStore:
             plan_id=plan_id,
             available_now=available,
             waiting=waiting,
+            off_path=tuple(
+                (check_id, run.off_path_reasons.get(check_id, ""),
+                 run.actual_costs.get(check_id, 0.0))
+                for check_id in sorted(run.check_states)
+                if run.check_states[check_id] == "off_path")
+            if run is not None else (),
             paths=tuple(paths),
             common_check_ids=common,
             common_cost=common_cost,
@@ -1158,10 +1169,13 @@ class InvestigationStore:
 
         def extend(prefix: list[tuple[str, str]], check_id: str) -> None:
             check = by_id[check_id]
-            outcomes = [self._find_planned_outcome(
-                check, run.observed_outcomes[check_id])] \
-                if run is not None and check_id in run.observed_outcomes \
-                else list(check.outcomes)
+            if run is not None \
+                    and run.check_states.get(check_id) == "completed" \
+                    and check_id in run.observed_outcomes:
+                outcomes = [self._find_planned_outcome(
+                    check, run.observed_outcomes[check_id])]
+            else:
+                outcomes = list(check.outcomes)
             for outcome in outcomes:
                 next_prefix = [*prefix, (check_id, outcome.outcome_id)]
                 next_ids = list(outcome.next_check_ids)
@@ -1180,8 +1194,9 @@ class InvestigationStore:
                     groups = self._indistinguishable_groups(
                         [after[hid] for hid in retained])
                     total_cost = sum(by_id[item].cost for item in unique_ids)
-                    completed_cost = sum(run.actual_costs.get(item, 0.0)
-                                         for item in unique_ids) if run else 0.0
+                    completed_cost = sum(
+                        min(run.actual_costs.get(item, 0.0), by_id[item].cost)
+                        for item in unique_ids) if run else 0.0
                     additional_cost = max(0.0, total_cost - completed_cost)
                     spent = run.spent_cost if run is not None else 0.0
                     paths.append({
@@ -1304,7 +1319,8 @@ class InvestigationStore:
             outcome = self._find_planned_outcome(check, outcome_id)
         except KeyError:
             run.spent_cost += actual_cost
-            run.actual_costs[check_id] = actual_cost
+            run.actual_costs[check_id] = (
+                run.actual_costs.get(check_id, 0.0) + actual_cost)
             run.check_states[check_id] = "out_of_range"
             self._append_run_event(
                 run, "out_of_range", check_id=check_id, outcome_id=str(outcome_id),
@@ -1312,7 +1328,8 @@ class InvestigationStore:
             self._refresh_plan_blockers(plan, run)
             return run
         run.spent_cost += actual_cost
-        run.actual_costs[check_id] = actual_cost
+        run.actual_costs[check_id] = (
+            run.actual_costs.get(check_id, 0.0) + actual_cost)
         run.check_states[check_id] = "completed"
         run.observed_outcomes[check_id] = outcome.outcome_id
         if batch_id is not None:
@@ -1387,6 +1404,8 @@ class InvestigationStore:
         for check_id, state in list(run.check_states.items()):
             if state in {"pending", "available", "blocked", "waiting", "in_progress"}:
                 run.check_states[check_id] = "uncommitted"
+            elif state == "off_path" and check_id not in run.actual_costs:
+                run.check_states[check_id] = "uncommitted"
         self._append_run_event(run, "terminated", note=note)
         return run
 
@@ -1423,14 +1442,41 @@ class InvestigationStore:
             return
         by_id = {check.check_id: check for check in plan.checks}
         incoming = self._plan_incoming(plan)
-        for check_id in sorted(by_id, key=lambda item: item):
+        off_path = self._plan_off_path_reasons(plan, run)
+        for check_id in self._plan_topo_order(plan):
             state = run.check_states.get(check_id)
-            if state not in {"pending", "available", "blocked", "waiting"}:
+            reason = off_path.get(check_id)
+            if reason is not None:
+                run.off_path_reasons[check_id] = reason
+                if state != "off_path":
+                    run.check_states[check_id] = "off_path"
+                    self._append_run_event(
+                        run, "check_off_path", check_id=check_id,
+                        cost=run.actual_costs.get(check_id, 0.0), note=reason)
+                continue
+            if state == "off_path":
+                if check_id in run.observed_outcomes:
+                    restored = "completed"
+                elif check_id in run.actual_costs:
+                    restored = "out_of_range"
+                else:
+                    restored = "pending"
+                run.check_states[check_id] = restored
+                run.off_path_reasons.pop(check_id, None)
+                self._append_run_event(
+                    run, "check_restored", check_id=check_id,
+                    note="back on the selected path")
+                if restored != "pending":
+                    continue
+                state = "pending"
+            if state not in {"pending", "available", "blocked", "waiting",
+                             "invalid"}:
                 continue
             missing_materials = set(by_id[check_id].required_materials) \
                 - set(run.available_materials)
             predecessor_states = {run.check_states.get(parent)
                                   for parent in incoming[check_id]}
+            predecessor_states.discard("off_path")
             invalid_basis = predecessor_states & {
                 "invalid", "out_of_range", "uncommitted", "blocked"}
             waiting_basis = predecessor_states - {
@@ -1443,6 +1489,60 @@ class InvestigationStore:
                 run.check_states[check_id] = "blocked"
             elif run.status == "active":
                 run.check_states[check_id] = "available"
+
+    @staticmethod
+    def _plan_topo_order(plan: VerificationPlan) -> list[str]:
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = InvestigationStore._plan_incoming(plan)
+        order: list[str] = []
+        seen: set[str] = set()
+
+        def visit(check_id: str) -> None:
+            if check_id in seen:
+                return
+            seen.add(check_id)
+            for parent in sorted(incoming[check_id]):
+                visit(parent)
+            order.append(check_id)
+
+        for check_id in sorted(by_id):
+            visit(check_id)
+        return order
+
+    def _plan_off_path_reasons(self, plan: VerificationPlan,
+                               run: PlanRun) -> dict[str, str]:
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        memo: dict[str, list[str]] = {}
+
+        def reasons_for(check_id: str) -> list[str]:
+            if check_id in memo:
+                return memo[check_id]
+            collected: list[str] = []
+            for parent in sorted(incoming[check_id]):
+                parent_reasons = reasons_for(parent)
+                if parent_reasons:
+                    collected.append(
+                        f"predecessor {parent!r} is off the selected path")
+                    continue
+                if run.check_states.get(parent) == "completed":
+                    outcome_id = run.observed_outcomes.get(parent)
+                    outcome = next(
+                        (item for item in by_id[parent].outcomes
+                         if item.outcome_id == outcome_id), None)
+                    if outcome is None or check_id not in outcome.next_check_ids:
+                        collected.append(
+                            f"predecessor {parent!r} recorded outcome "
+                            f"{outcome_id!r} which does not lead to {check_id!r}")
+                        continue
+                memo[check_id] = []
+                return []
+            memo[check_id] = collected
+            return collected
+
+
+        return {check_id: "; ".join(reasons_for(check_id))
+                for check_id in by_id if reasons_for(check_id)}
 
     def _append_run_event(
         self, run: PlanRun, action: str, *,

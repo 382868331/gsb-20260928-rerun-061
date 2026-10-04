@@ -353,6 +353,7 @@ class PlanRun:
     available_materials: frozenset[str] = frozenset()
     check_states: dict[str, str] = field(default_factory=dict)
     observed_outcomes: dict[str, str] = field(default_factory=dict)
+    off_path_reasons: dict[str, str] = field(default_factory=dict)
     evidence_batches: dict[str, str] = field(default_factory=dict)
     actual_costs: dict[str, float] = field(default_factory=dict)
     events: list[PlanRunEvent] = field(default_factory=list)
@@ -366,6 +367,7 @@ class PlanRun:
             "available_materials": sorted(self.available_materials),
             "check_states": dict(self.check_states),
             "observed_outcomes": dict(self.observed_outcomes),
+            "off_path_reasons": dict(self.off_path_reasons),
             "evidence_batches": dict(self.evidence_batches),
             "actual_costs": dict(self.actual_costs),
             "events": [event.as_dict() for event in self.events],
@@ -382,7 +384,9 @@ class PlanRun:
             check_states={str(k): str(v)
                           for k, v in data.get("check_states", {}).items()},
             observed_outcomes={str(k): str(v)
-                              for k, v in data.get("observed_outcomes", {}).items()},
+                               for k, v in data.get("observed_outcomes", {}).items()},
+            off_path_reasons={str(k): str(v)
+                              for k, v in data.get("off_path_reasons", {}).items()},
             evidence_batches={str(k): str(v)
                               for k, v in data.get("evidence_batches", {}).items()},
             actual_costs={str(k): float(v)
