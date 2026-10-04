@@ -746,3 +746,123 @@ def test_choice_correction_out_of_range_and_snapshot_roundtrip(tmp_path):
     assert reloaded.plan_run("run-1").check_states["join"] == "available"
     assert reloaded.plan_run("run-1").spent_cost == 10
     assert reloaded.off_path_plan_checks("run-1")[0]["sunk_cost"] == 3
+
+
+def _run_with_left_completed(store):
+    run = store.start_plan_run("branches", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left",
+                                   batch_id="batch-root")
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "left-done",
+                                   batch_id="batch-left")
+    return run
+
+
+def test_correction_preview_does_not_mutate_and_confirm_applies():
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = _run_with_left_completed(store)
+    assert run.check_states["join"] == "available"
+    before_states = dict(run.check_states)
+    before_events = len(run.events)
+
+    preview = store.preview_plan_correction("run-1", "root", "go-right")
+    # Completed left branch falls off the selected path; the join re-waits.
+    assert preview.invalidated_check_ids == ("left",)
+    assert preview.rewaiting_check_ids == ("join",)
+    # Only evidence attached to checks still on the path is retained.
+    assert preview.retained_evidence == (("root", "batch-root"),)
+    # Worst case after the switch: right (5) + join (1) still fit the budget.
+    assert preview.budget_remaining_in_worst_case == 9
+    assert preview.potential_budget_increase == 0
+    assert preview.status == "pending"
+    # The preview itself changed nothing.
+    assert run.check_states == before_states
+    assert len(run.events) == before_events
+    assert run.observed_outcomes == {"root": "go-left", "left": "left-done"}
+
+    confirmed = store.confirm_plan_correction(preview.preview_id)
+    assert confirmed.check_states["right"] == "available"
+    assert confirmed.check_states["join"] == "waiting"
+    assert confirmed.observed_outcomes["root"] == "go-right"
+    assert confirmed.spent_cost == 5  # sunk cost is preserved, not re-spent
+    assert [entry["check_id"]
+            for entry in store.off_path_plan_checks("run-1")] == ["left"]
+    assert store.correction_previews("run-1")[0].status == "applied"
+    with pytest.raises(ValueError):
+        store.confirm_plan_correction(preview.preview_id)
+
+
+def test_correction_preview_requires_fresh_preview_after_evidence_change():
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    _run_with_left_completed(store)
+    preview = store.preview_plan_correction("run-1", "root", "go-right")
+
+    store.receive_evidence("team", [{"record_id": "late-1", "kind": "process",
+                                     "ts": 1.0}])
+    with pytest.raises(ValueError, match="fresh correction preview"):
+        store.confirm_plan_correction(preview.preview_id)
+    assert store.correction_previews("run-1")[0].status == "stale"
+
+    # A fresh preview against the new evidence state can be confirmed.
+    fresh = store.preview_plan_correction("run-1", "root", "go-right")
+    store.confirm_plan_correction(fresh.preview_id)
+    assert store.plan_run("run-1").observed_outcomes["root"] == "go-right"
+
+
+def test_correction_preview_requires_fresh_preview_after_budget_change():
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    _run_with_left_completed(store)
+    preview = store.preview_plan_correction("run-1", "root", "go-right")
+
+    store.verification_plan("branches").budget = 6
+    with pytest.raises(ValueError, match="fresh correction preview"):
+        store.confirm_plan_correction(preview.preview_id)
+
+    tighter = store.preview_plan_correction("run-1", "root", "go-right")
+    # spent 5 + worst-case remaining 6 exceeds the tightened budget of 6.
+    assert tighter.potential_budget_increase == 5
+    assert tighter.budget_remaining_in_worst_case == -5
+
+
+def test_conflicting_correction_previews_and_snapshot_roundtrip(tmp_path):
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = store.start_plan_run("branches", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left")
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "weird")
+    assert run.check_states["left"] == "out_of_range"
+
+    # Two mutually exclusive corrections can be previewed side by side.
+    switch = store.preview_plan_correction("run-1", "root", "go-right")
+    fix_left = store.preview_plan_correction("run-1", "left", "left-done")
+    # left is out_of_range (not completed), so nothing completed is lost;
+    # the blocked join goes back to waiting for the right branch instead.
+    assert switch.invalidated_check_ids == ()
+    assert switch.rewaiting_check_ids == ("join",)
+    assert fix_left.invalidated_check_ids == ()
+    assert fix_left.rewaiting_check_ids == ()
+    assert {p.status for p in store.correction_previews("run-1")} == {"pending"}
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "previews.json"))
+    restored = {p.preview_id: p for p in reloaded.correction_previews("run-1")}
+    assert restored[switch.preview_id].status == "pending"
+    assert restored[switch.preview_id].rewaiting_check_ids == ("join",)
+    assert restored[fix_left.preview_id].retained_evidence == ()
+
+    # Confirming one preview stales the conflicting one, even after reload.
+    reloaded.confirm_plan_correction(switch.preview_id)
+    statuses = {p.preview_id: p.status
+                for p in reloaded.correction_previews("run-1")}
+    assert statuses[switch.preview_id] == "applied"
+    assert statuses[fix_left.preview_id] == "stale"
+    with pytest.raises(ValueError):
+        reloaded.confirm_plan_correction(fix_left.preview_id)
+    assert reloaded.plan_run("run-1").observed_outcomes == {"root": "go-right"}
+    assert reloaded.plan_run("run-1").check_states["left"] == "out_of_range"

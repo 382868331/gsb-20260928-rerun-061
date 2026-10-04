@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -159,6 +161,75 @@ class ConditionalPlanPreview:
         }
 
 
+@dataclass
+class CorrectionPreview:
+    """Pre-execution impact preview for correcting a recorded check outcome.
+
+    The preview is computed against a private simulation of the run; the
+    real run is untouched until confirm_plan_correction() applies exactly
+    the recorded change.  The state fingerprint captures the evidence and
+    budget inputs the preview depended on, so any later evidence or budget
+    change forces a fresh preview instead of a stale confirmation.
+    """
+
+    preview_id: str
+    run_id: str
+    plan_id: str
+    check_id: str
+    outcome_id: str
+    invalidated_check_ids: tuple[str, ...]
+    rewaiting_check_ids: tuple[str, ...]
+    retained_evidence: tuple[tuple[str, str], ...]
+    potential_budget_increase: float | None
+    budget_remaining_in_worst_case: float | None
+    state_fingerprint: str
+    created_at: float | None
+    status: str = "pending"  # pending | applied | stale
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "preview_id": self.preview_id,
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "check_id": self.check_id,
+            "outcome_id": self.outcome_id,
+            "invalidated_check_ids": list(self.invalidated_check_ids),
+            "rewaiting_check_ids": list(self.rewaiting_check_ids),
+            "retained_evidence": [
+                {"check_id": check_id, "batch_id": batch_id}
+                for check_id, batch_id in self.retained_evidence],
+            "potential_budget_increase": self.potential_budget_increase,
+            "budget_remaining_in_worst_case":
+                self.budget_remaining_in_worst_case,
+            "state_fingerprint": self.state_fingerprint,
+            "created_at": self.created_at,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CorrectionPreview":
+        return cls(
+            preview_id=str(data["preview_id"]),
+            run_id=str(data["run_id"]),
+            plan_id=str(data["plan_id"]),
+            check_id=str(data["check_id"]),
+            outcome_id=str(data["outcome_id"]),
+            invalidated_check_ids=tuple(
+                str(item) for item in data.get("invalidated_check_ids", ())),
+            rewaiting_check_ids=tuple(
+                str(item) for item in data.get("rewaiting_check_ids", ())),
+            retained_evidence=tuple(
+                (str(item["check_id"]), str(item["batch_id"]))
+                for item in data.get("retained_evidence", ())),
+            potential_budget_increase=data.get("potential_budget_increase"),
+            budget_remaining_in_worst_case=data.get(
+                "budget_remaining_in_worst_case"),
+            state_fingerprint=str(data.get("state_fingerprint", "")),
+            created_at=data.get("created_at"),
+            status=str(data.get("status", "pending")),
+        )
+
+
 class InvestigationStore:
     """In-memory evidence graph, rebuilt deterministically from raw records.
 
@@ -195,6 +266,8 @@ class InvestigationStore:
         self._plan_runs: dict[str, PlanRun] = {}
         self._received_batches: dict[str, ReceivedBatch] = {}
         self._evidence_decisions: list[EvidenceDecision] = []
+        # Pending/applied correction impact previews (never mutate runs).
+        self._correction_previews: dict[str, CorrectionPreview] = {}
 
     # ---------------------------------------------------------------- import
 
@@ -1523,6 +1596,145 @@ class InvestigationStore:
         self._refresh_plan_blockers(plan, run)
         return run
 
+    def preview_plan_correction(
+        self, run_id: str, check_id: str, outcome_id: str, *,
+        preview_id: str | None = None,
+    ) -> CorrectionPreview:
+        """Simulate correcting a recorded outcome; the run is not modified.
+
+        The preview lists completed checks that would fall off the selected
+        path, join checks that would go back to waiting, evidence batches
+        that remain usable, and the budget headroom after the change.
+        """
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        check = self._find_planned_check(plan, check_id)
+        self._require_active_run(run)
+        if run.check_states.get(check_id) not in {"completed", "out_of_range"}:
+            raise ImportError(
+                f"check {check_id!r} has no recorded outcome to correct")
+        outcome = self._find_planned_outcome(check, outcome_id)
+        incoming = self._plan_incoming(plan)
+        reachable_before = self._reachable_plan_checks(plan, run)
+        simulated = copy.deepcopy(run)
+        simulated.observed_outcomes[check_id] = outcome.outcome_id
+        simulated.check_states[check_id] = "completed"
+        self._refresh_plan_blockers(plan, simulated)
+        reachable_after = self._reachable_plan_checks(plan, simulated)
+        invalidated = tuple(sorted(
+            check_id_key
+            for check_id_key, state in run.check_states.items()
+            if state == "completed" and check_id_key != check_id
+            and check_id_key in reachable_before
+            and check_id_key not in reachable_after))
+        rewaiting = tuple(sorted(
+            check_id_key
+            for check_id_key, state in simulated.check_states.items()
+            if state == "waiting" and len(incoming[check_id_key]) > 1
+            and run.check_states.get(check_id_key) != "waiting"))
+        retained = tuple(sorted(
+            (check_id_key, batch_id)
+            for check_id_key, batch_id in run.evidence_batches.items()
+            if simulated.check_states.get(check_id_key) == "completed"
+            and check_id_key in reachable_after))
+        paths = self._conditional_plan_paths(plan, simulated)
+        worst_additional = max(
+            (float(path["additional_cost"]) for path in paths), default=0.0)
+        if plan.budget is None:
+            budget_remaining = None
+            budget_increase = None
+        else:
+            budget_remaining = plan.budget - simulated.spent_cost \
+                - worst_additional
+            budget_increase = max(0.0, -budget_remaining)
+        preview_id = str(preview_id or
+                         f"preview-{run.run_id}-{check_id}-"
+                         f"{len(self._correction_previews) + 1}")
+        if preview_id in self._correction_previews:
+            raise ImportError(f"correction preview {preview_id!r} already exists")
+        preview = CorrectionPreview(
+            preview_id=preview_id,
+            run_id=run.run_id,
+            plan_id=plan.plan_id,
+            check_id=check_id,
+            outcome_id=outcome.outcome_id,
+            invalidated_check_ids=invalidated,
+            rewaiting_check_ids=rewaiting,
+            retained_evidence=retained,
+            potential_budget_increase=budget_increase,
+            budget_remaining_in_worst_case=budget_remaining,
+            state_fingerprint=self._correction_fingerprint(plan, run),
+            created_at=time.time(),
+        )
+        self._correction_previews[preview.preview_id] = preview
+        return preview
+
+    def confirm_plan_correction(self, preview_id: str, *,
+                                note: str = "") -> PlanRun:
+        """Apply a pending preview exactly as computed.
+
+        If evidence or budget relevant state changed since the preview was
+        created, the preview is marked stale and a fresh preview is
+        required instead of applying an outdated change.
+        """
+        preview = self._correction_previews[str(preview_id)]
+        if preview.status != "pending":
+            raise ImportError(
+                f"correction preview {preview.preview_id!r} is "
+                f"{preview.status}, not pending")
+        run = self.plan_run(preview.run_id)
+        plan = self.verification_plan(run.plan_id)
+        current = self._correction_fingerprint(plan, run)
+        if current != preview.state_fingerprint:
+            preview.status = "stale"
+            raise ImportError(
+                "evidence or budget changed since the preview; "
+                "create a fresh correction preview")
+        run = self.correct_plan_check_outcome(
+            preview.run_id, preview.check_id, preview.outcome_id,
+            note=note or f"confirmed preview {preview.preview_id}")
+        preview.status = "applied"
+        for other in self._correction_previews.values():
+            if other.status == "pending" and other.run_id == preview.run_id:
+                other.status = "stale"
+        return run
+
+    def correction_previews(self, run_id: str | None = None
+                            ) -> list[CorrectionPreview]:
+        previews = [self._correction_previews[key]
+                    for key in sorted(self._correction_previews)]
+        if run_id is not None:
+            previews = [preview for preview in previews
+                        if preview.run_id == str(run_id)]
+        return previews
+
+    def _correction_fingerprint(self, plan: VerificationPlan,
+                                run: PlanRun) -> str:
+        """Digest of the evidence/budget inputs a correction preview uses."""
+        payload = {
+            "budget": plan.budget,
+            "run": {
+                "status": run.status,
+                "spent_cost": run.spent_cost,
+                "check_states": run.check_states,
+                "observed_outcomes": run.observed_outcomes,
+                "evidence_batches": run.evidence_batches,
+                "actual_costs": run.actual_costs,
+                "available_materials": sorted(run.available_materials),
+            },
+            "batches": [
+                {"batch_id": batch.batch_id, "status": batch.status}
+                for batch in self.received_batches()
+            ],
+            "decisions": [
+                [decision.decision_id, decision.action,
+                 sorted(decision.record_ids)]
+                for decision in self._evidence_decisions
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
     def off_path_plan_checks(self, run_id: str) -> tuple[dict[str, Any], ...]:
         """Executed checks no longer on the selected path, with sunk cost."""
         run = self.plan_run(run_id)
@@ -2237,7 +2449,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 5,
+            "version": 6,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -2292,6 +2504,9 @@ class InvestigationStore:
                 decision.as_dict() for decision in self._evidence_decisions
             ],
             "plan_runs": [run.as_dict() for run in self.plan_runs()],
+            "correction_previews": [
+                preview.as_dict() for preview in self.correction_previews()
+            ],
             "manual_judgments": [
                 {"link_id": judgment.link_id, "action": judgment.action,
                  "recorded_at": judgment.recorded_at, "note": judgment.note,
@@ -2325,7 +2540,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3, 4, 5):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -2427,4 +2642,7 @@ class InvestigationStore:
         for item in data.get("plan_runs", ()):
             run = PlanRun.from_dict(item)
             store._plan_runs[run.run_id] = run
+        for item in data.get("correction_previews", ()):
+            preview = CorrectionPreview.from_dict(item)
+            store._correction_previews[preview.preview_id] = preview
         return store

@@ -21,6 +21,7 @@ from .store import ImportError as InvestigationImportError
 from .store import (
     ConditionalPlanPreview,
     ConflictGroup,
+    CorrectionPreview,
     OutcomeAssessment,
     HypothesisSet,
     HypothesisSetExplanation,
@@ -41,6 +42,7 @@ __all__ = [
     "MANUAL_SOURCE",
     "ConflictGroup",
     "ConditionalPlanPreview",
+    "CorrectionPreview",
     "OutcomeAssessment",
     "HypothesisSet",
     "HypothesisSetExplanation",

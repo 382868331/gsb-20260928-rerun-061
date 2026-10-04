@@ -70,6 +70,12 @@
   步骤保留历史状态与成本，`off_path_plan_checks(...)` 明确列出原因与沉没
   成本；预算预览的 `spent_cost` / `budget_remaining_in_worst_case` 始终包含
   已实际花费的旁支，互斥分支不会相加。
+- **更正先预览后确认**：`preview_plan_correction(...)` 在私有副本上试算
+  更正结果，列出将失效的已完成节点、重新等待的汇合节点、仍可保留的证据
+  批次和可能增加的预算，当前执行状态完全不变。`confirm_plan_correction(...)`
+  应用与预览完全相同的变更；若预览之后证据或预算发生变化，预览被标记
+  `stale`，必须重新预览才能确认。同一执行可同时保存多个相互冲突的预览，
+  确认其一后其余自动失效；预览随快照保存、重载后仍可确认。
 
 ## 记录格式
 
@@ -185,6 +191,12 @@ store.start_plan_check("run-1", "common")
 store.record_plan_check_result("run-1", "common", "supports-a")
 store.correct_plan_check_outcome("run-1", "common", "supports-b")  # 修正选择
 store.off_path_plan_checks("run-1")  # 已执行但不在新路径上的步骤及沉没成本
+preview = store.preview_plan_correction("run-1", "common", "supports-a")
+preview.invalidated_check_ids        # 将失效的已完成节点
+preview.rewaiting_check_ids          # 重新等待的汇合节点
+preview.retained_evidence            # 仍可保留的 (check_id, batch_id)
+preview.potential_budget_increase    # 可能增加的预算
+store.confirm_plan_correction(preview.preview_id)  # 应用与预览相同的变更
 store.pause_plan_run("run-1")
 store.resume_plan_run("run-1")
 store.compare_plan_runs("run-1")
