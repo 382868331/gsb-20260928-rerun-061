@@ -746,3 +746,155 @@ def test_choice_correction_out_of_range_and_snapshot_roundtrip(tmp_path):
     assert reloaded.plan_run("run-1").check_states["join"] == "available"
     assert reloaded.plan_run("run-1").spent_cost == 10
     assert reloaded.off_path_plan_checks("run-1")[0]["sunk_cost"] == 3
+
+
+def test_correction_preview_does_not_mutate_and_confirm_applies_same_change(
+    tmp_path,
+):
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = store.start_plan_run("branches", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left",
+                                   batch_id="batch-root")
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "left-done",
+                                   batch_id="batch-left")
+    store.start_plan_check("run-1", "join")
+    store.record_plan_check_result("run-1", "join", "join-done",
+                                   batch_id="batch-join")
+    spent_before = run.spent_cost
+    states_before = dict(run.check_states)
+
+    preview = store.preview_plan_check_correction(
+        "run-1", "root", "go-right", note="lab prefers right branch")
+
+    # The preview is a dry run: the live execution state is untouched.
+    assert run.check_states == states_before
+    assert run.spent_cost == spent_before
+    assert preview.invalidated_check_ids == ("left",)
+    assert preview.reset_waiting_check_ids == ("join",)
+    # Root evidence stays usable; evidence of the deselected branch and of
+    # the join that must wait again is retained only as history.
+    assert preview.retained_evidence == {"root": "batch-root"}
+    assert preview.historical_evidence == {
+        "left": "batch-left", "join": "batch-join"}
+    assert preview.off_path_sunk_cost == 3
+    assert preview.additional_budget_worst_case == 6  # right(5) + join(1)
+    assert preview.budget_delta_worst_case == 6
+    assert preview.budget_remaining_after == 8
+    assert preview.resulting_states == {
+        "root": "completed", "left": "completed",
+        "right": "available", "join": "waiting"}
+    assert preview.resulting_outcomes == {
+        "root": "go-right", "left": "left-done"}
+
+    store.confirm_plan_check_correction(preview.preview_id)
+    assert run.check_states == preview.resulting_states
+    assert run.observed_outcomes == preview.resulting_outcomes
+    assert run.spent_cost == spent_before  # sunk cost is never erased
+    assert store.off_path_plan_checks("run-1")[0]["sunk_cost"] == 3
+    assert run.events[-1].action == "outcome_corrected"
+    assert run.events[-1].batch_id == f"preview:{preview.preview_id}"
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "preview.json"))
+    restored_preview = reloaded.correction_preview(preview.preview_id)
+    assert restored_preview.status == "confirmed"
+    assert restored_preview.invalidated_check_ids == ("left",)
+    assert restored_preview.reset_waiting_check_ids == ("join",)
+    assert restored_preview.retained_evidence == {"root": "batch-root"}
+
+
+def test_two_conflicting_correction_previews_coexist():
+    store = InvestigationStore()
+    store.create_verification_plan("p", [
+        {"check_id": "root", "label": "root", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [
+             {"outcome_id": "go-a", "next_check_ids": ["leaf-a"]},
+             {"outcome_id": "go-b", "next_check_ids": ["leaf-b"]}]},
+        {"check_id": "leaf-a", "label": "a", "source_id": "team",
+         "relation": "parent", "cost": 3,
+         "outcomes": [{"outcome_id": "a-done"}]},
+        {"check_id": "leaf-b", "label": "b", "source_id": "team",
+         "relation": "parent", "cost": 5,
+         "outcomes": [{"outcome_id": "b-done"}]},
+    ], budget=20)
+    run = store.start_plan_run("p", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-a")
+    store.start_plan_check("run-1", "leaf-a")
+    store.record_plan_check_result("run-1", "leaf-a", "a-done")
+
+    to_b = store.preview_plan_check_correction(
+        "run-1", "root", "go-b")
+    # A second preview of the same decision point conflicts with the first
+    # but neither replaces nor invalidates the other.
+    stay_a = store.preview_plan_check_correction(
+        "run-1", "root", "go-a") if False else None
+    to_b_again = store.preview_plan_check_correction(
+        "run-1", "root", "go-b", note="duplicate review")
+    open_previews = store.correction_previews("run-1")
+    assert {item.preview_id for item in open_previews} == {
+        to_b.preview_id, to_b_again.preview_id}
+    assert all(item.status == "open" for item in open_previews)
+
+    store.confirm_plan_check_correction(to_b.preview_id)
+    assert run.check_states["leaf-b"] == "available"
+    assert store.correction_preview(to_b_again.preview_id).status == "superseded"
+    with pytest.raises(ValueError):
+        store.confirm_plan_check_correction(to_b_again.preview_id)
+
+
+def test_stale_correction_preview_requires_fresh_preview():
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = store.start_plan_run("branches", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left")
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "left-done")
+
+    preview = store.preview_plan_check_correction(
+        "run-1", "root", "go-right")
+    # Budget-affecting activity after the preview invalidates it.
+    store.add_plan_material("run-1", "image")
+    with pytest.raises(ValueError):
+        store.confirm_plan_check_correction(preview.preview_id)
+
+    fresh = store.preview_plan_check_correction(
+        "run-1", "root", "go-right")
+    store.withdraw_plan_material("run-1", "image")
+    with pytest.raises(ValueError):
+        store.confirm_plan_check_correction(fresh.preview_id)
+
+
+def test_correction_preview_handles_out_of_range_to_planned_outcome():
+    store = InvestigationStore()
+    store.create_verification_plan("p", [
+        {"check_id": "a", "label": "a", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [{"outcome_id": "a-yes",
+                       "next_check_ids": ["b"]}]},
+        {"check_id": "b", "label": "b", "source_id": "team",
+         "relation": "parent", "cost": 4,
+         "outcomes": [{"outcome_id": "b-yes"}]},
+    ], budget=10)
+    run = store.start_plan_run("p", "run-1")
+    store.start_plan_check("run-1", "a")
+    store.record_plan_check_result("run-1", "a", "a-yes")
+    store.start_plan_check("run-1", "b")
+    store.record_plan_check_result("run-1", "b", "unexpected")
+    assert run.check_states["b"] == "out_of_range"
+
+    preview = store.preview_plan_check_correction(
+        "run-1", "b", "b-yes")
+    assert preview.previous_outcome_id is None
+    assert preview.invalidated_check_ids == ()
+    assert preview.reset_waiting_check_ids == ()
+    assert preview.resulting_states["b"] == "completed"
+    assert run.check_states["b"] == "out_of_range"  # still untouched
+    store.confirm_plan_check_correction(preview.preview_id)
+    assert run.check_states["b"] == "completed"
+    assert run.observed_outcomes["b"] == "b-yes"

@@ -70,6 +70,13 @@
   步骤保留历史状态与成本，`off_path_plan_checks(...)` 明确列出原因与沉没
   成本；预算预览的 `spent_cost` / `budget_remaining_in_worst_case` 始终包含
   已实际花费的旁支，互斥分支不会相加。
+- **修正先预览后执行**：`preview_plan_check_correction(...)` 在不动当前执行
+  状态的前提下，列出将失效的已完成节点、需重新等待的汇合节点、仍可保留
+  使用的证据与仅作历史保留的证据、最坏情况下可能增加的预算及预算余量变化。
+  预览经快照保存/重载；`confirm_plan_check_correction(preview_id)` 只应用
+  与预览完全相同的变更——预览后证据、预算、材料或结果发生变化时指纹不符，
+  必须重新预览。同一决策点可保留两次相互冲突的预览，确认其一会使另一个
+  变为 `superseded`。
 
 ## 记录格式
 
@@ -185,6 +192,16 @@ store.start_plan_check("run-1", "common")
 store.record_plan_check_result("run-1", "common", "supports-a")
 store.correct_plan_check_outcome("run-1", "common", "supports-b")  # 修正选择
 store.off_path_plan_checks("run-1")  # 已执行但不在新路径上的步骤及沉没成本
+preview = store.preview_plan_check_correction(
+    "run-1", "common", "supports-a")  # 执行前影响预览（试运行，不改状态）
+preview.invalidated_check_ids          # 将失效的已完成节点
+preview.reset_waiting_check_ids        # 需要重新等待的汇合节点
+preview.retained_evidence              # 仍可保留使用的证据
+preview.historical_evidence            # 仅作为历史保留的证据
+preview.additional_budget_worst_case   # 可能增加的预算（最坏分支）
+store.confirm_plan_check_correction(preview.preview_id)  # 应用完全相同的变更
+# 预览后证据/成本/材料/结果若有变化，确认会被拒绝，必须重新预览；
+# 两次相互冲突的预览可同时保存，确认其一会把另一个标记为 superseded。
 store.pause_plan_run("run-1")
 store.resume_plan_run("run-1")
 store.compare_plan_runs("run-1")

@@ -393,6 +393,103 @@ class PlanRun:
 
 
 @dataclass
+class CorrectionPreview:
+    """Dry-run impact report for correcting one recorded check outcome.
+
+    The preview captures a frozen trial state and a fingerprint of the run
+    it was computed from.  Confirming the preview replays the exact same
+    trial against the live run; if the run moved (evidence withdrawn, cost
+    recorded, material changed, ...) the fingerprint mismatches and a fresh
+    preview is required.
+    """
+
+    preview_id: str
+    run_id: str
+    plan_id: str
+    check_id: str
+    previous_outcome_id: str | None
+    new_outcome_id: str
+    invalidated_check_ids: tuple[str, ...]
+    reset_waiting_check_ids: tuple[str, ...]
+    retained_evidence: dict[str, str]
+    historical_evidence: dict[str, str]
+    off_path_sunk_cost: float
+    spent_cost_before: float
+    additional_budget_worst_case: float
+    budget_delta_worst_case: float
+    uncommitted_cost_after: float
+    budget_remaining_after: float | None
+    resulting_states: dict[str, str]
+    resulting_outcomes: dict[str, str]
+    fingerprint: str
+    status: str = "open"
+    created_at: float | None = None
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "preview_id": self.preview_id,
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "check_id": self.check_id,
+            "previous_outcome_id": self.previous_outcome_id,
+            "new_outcome_id": self.new_outcome_id,
+            "invalidated_check_ids": list(self.invalidated_check_ids),
+            "reset_waiting_check_ids": list(self.reset_waiting_check_ids),
+            "retained_evidence": dict(self.retained_evidence),
+            "historical_evidence": dict(self.historical_evidence),
+            "off_path_sunk_cost": self.off_path_sunk_cost,
+            "spent_cost_before": self.spent_cost_before,
+            "additional_budget_worst_case": self.additional_budget_worst_case,
+            "budget_delta_worst_case": self.budget_delta_worst_case,
+            "uncommitted_cost_after": self.uncommitted_cost_after,
+            "budget_remaining_after": self.budget_remaining_after,
+            "resulting_states": dict(self.resulting_states),
+            "resulting_outcomes": dict(self.resulting_outcomes),
+            "fingerprint": self.fingerprint,
+            "status": self.status,
+            "created_at": self.created_at,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CorrectionPreview":
+        return cls(
+            preview_id=str(data["preview_id"]),
+            run_id=str(data["run_id"]),
+            plan_id=str(data["plan_id"]),
+            check_id=str(data["check_id"]),
+            previous_outcome_id=data.get("previous_outcome_id"),
+            new_outcome_id=str(data["new_outcome_id"]),
+            invalidated_check_ids=tuple(
+                str(item) for item in data.get("invalidated_check_ids", ())),
+            reset_waiting_check_ids=tuple(
+                str(item) for item in data.get("reset_waiting_check_ids", ())),
+            retained_evidence={str(k): str(v)
+                               for k, v in data.get("retained_evidence", {}).items()},
+            historical_evidence={str(k): str(v)
+                                 for k, v in
+                                 data.get("historical_evidence",
+                                          data.get("detached_evidence", {})).items()},
+            off_path_sunk_cost=float(data.get("off_path_sunk_cost", 0.0)),
+            spent_cost_before=float(data.get("spent_cost_before", 0.0)),
+            additional_budget_worst_case=float(
+                data.get("additional_budget_worst_case", 0.0)),
+            budget_delta_worst_case=float(data.get("budget_delta_worst_case", 0.0)),
+            uncommitted_cost_after=float(data.get("uncommitted_cost_after", 0.0)),
+            budget_remaining_after=data.get("budget_remaining_after"),
+            resulting_states={str(k): str(v)
+                              for k, v in data.get("resulting_states", {}).items()},
+            resulting_outcomes={str(k): str(v)
+                                for k, v in data.get("resulting_outcomes", {}).items()},
+            fingerprint=str(data.get("fingerprint", "")),
+            status=str(data.get("status", "open")),
+            created_at=data.get("created_at"),
+            note=str(data.get("note", "")),
+        )
+
+
+@dataclass
 class ReceivedBatch:
     """Incoming material held outside accepted evidence until reviewed."""
 

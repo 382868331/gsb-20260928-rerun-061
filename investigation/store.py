@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -13,6 +15,7 @@ from .models import (
     EventKind,
     Hypothesis,
     EvidenceDecision,
+    CorrectionPreview,
     ManualLink,
     PlanRun,
     PlanRunEvent,
@@ -195,6 +198,8 @@ class InvestigationStore:
         self._plan_runs: dict[str, PlanRun] = {}
         self._received_batches: dict[str, ReceivedBatch] = {}
         self._evidence_decisions: list[EvidenceDecision] = []
+        # Outstanding dry-run previews of outcome corrections.
+        self._correction_previews: dict[str, CorrectionPreview] = {}
 
     # ---------------------------------------------------------------- import
 
@@ -1523,6 +1528,298 @@ class InvestigationStore:
         self._refresh_plan_blockers(plan, run)
         return run
 
+    # ------------------------------------- correction preview (dry-run)
+
+    def preview_plan_check_correction(
+        self, run_id: str, check_id: str, outcome_id: str, *,
+        note: str = "",
+    ) -> CorrectionPreview:
+        """Dry-run ``correct_plan_check_outcome`` without touching the run.
+
+        The returned preview lists completed nodes that would lose force,
+        completed joins that would have to wait again, evidence that stays
+        usable versus evidence that becomes historical, and the additional
+        budget the new branch can still consume.  The live run is not
+        modified; use :meth:`confirm_plan_check_correction` to apply the
+        exact same change later.
+        """
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        check = self._find_planned_check(plan, check_id)
+        self._require_active_run(run)
+        if run.check_states.get(check_id) not in {"completed", "out_of_range"}:
+            raise ImportError(
+                f"check {check_id!r} has no recorded outcome to correct")
+        outcome = self._find_planned_outcome(check, outcome_id)
+        previous = run.observed_outcomes.get(check_id)
+        if previous == outcome.outcome_id \
+                and run.check_states[check_id] == "completed":
+            raise ImportError(
+                f"check {check_id!r} already records outcome "
+                f"{outcome.outcome_id!r}; nothing would change")
+        trial, reset_ids, invalidated_ids = self._correction_trial(
+            plan, run, check_id, outcome.outcome_id)
+        reachable = self._reachable_plan_checks(plan, trial)
+        invalidated_ids = tuple(sorted(
+            cid for cid in invalidated_ids if cid not in reachable))
+        historical = set(invalidated_ids) | set(reset_ids)
+        retained_evidence = {
+            cid: batch_id for cid, batch_id in trial.evidence_batches.items()
+            if cid not in historical}
+        historical_evidence = {
+            cid: batch_id for cid, batch_id in trial.evidence_batches.items()
+            if cid in historical}
+        off_path_sunk = sum(
+            run.actual_costs.get(cid, 0.0) for cid in invalidated_ids)
+        current_preview = self.preview_conditional_plan(plan.plan_id, run.run_id)
+        current_uncommitted = current_preview.uncommitted_cost
+        after_preview = self._conditional_preview_for_trial(
+            plan, run, trial, reset_ids)
+        uncommitted_after = after_preview["uncommitted_cost"]
+        additional = max(0.0, uncommitted_after)
+        preview = CorrectionPreview(
+            preview_id=self._next_preview_id(run.run_id),
+            run_id=run.run_id,
+            plan_id=plan.plan_id,
+            check_id=check_id,
+            previous_outcome_id=previous,
+            new_outcome_id=outcome.outcome_id,
+            invalidated_check_ids=invalidated_ids,
+            reset_waiting_check_ids=tuple(sorted(reset_ids)),
+            retained_evidence=retained_evidence,
+            historical_evidence=historical_evidence,
+            off_path_sunk_cost=off_path_sunk,
+            spent_cost_before=run.spent_cost,
+            additional_budget_worst_case=additional,
+            budget_delta_worst_case=uncommitted_after - current_uncommitted,
+            uncommitted_cost_after=uncommitted_after,
+            budget_remaining_after=(None if plan.budget is None
+                                    else plan.budget - run.spent_cost
+                                    - uncommitted_after),
+        resulting_states=self._correction_resulting_states(
+            run, trial, frozenset(invalidated_ids)),
+        resulting_outcomes=self._correction_resulting_outcomes(
+            run, trial, frozenset(invalidated_ids)),
+            fingerprint=self._correction_fingerprint(plan, run),
+            created_at=time.time(),
+            note=note,
+        )
+        self._correction_previews[preview.preview_id] = preview
+        return preview
+
+    def correction_previews(self, run_id: str | None = None
+                            ) -> tuple[CorrectionPreview, ...]:
+        """List saved previews, newest first; two conflicting previews coexist."""
+        previews = [item for item in self._correction_previews.values()
+                    if run_id is None or item.run_id == str(run_id)]
+        return tuple(sorted(
+            previews, key=lambda item: item.preview_id, reverse=True))
+
+    def correction_preview(self, preview_id: str) -> CorrectionPreview:
+        return self._correction_previews[str(preview_id)]
+
+    def confirm_plan_check_correction(
+        self, preview_id: str, *,
+        note: str | None = None,
+    ) -> PlanRun:
+        """Apply exactly the change described by a prior dry-run preview.
+
+        A preview whose fingerprint no longer matches the run (evidence or
+        budget changed since the dry run) is refused; a fresh preview is
+        required.  Applying a preview supersedes other open previews for the
+        same run, but conflicting previews taken before it remain on record.
+        """
+        preview = self.correction_preview(preview_id)
+        if preview.status != "open":
+            raise ImportError(
+                f"correction preview {preview.preview_id!r} is {preview.status}")
+        run = self.plan_run(preview.run_id)
+        plan = self.verification_plan(preview.plan_id)
+        current_fingerprint = self._correction_fingerprint(plan, run)
+        if current_fingerprint != preview.fingerprint:
+            raise ImportError(
+                "the run changed after this preview (evidence, cost, "
+                "materials or outcomes); request a fresh preview")
+        check = self._find_planned_check(plan, preview.check_id)
+        self._require_active_run(run)
+        if run.check_states.get(preview.check_id) not in {
+                "completed", "out_of_range"}:
+            raise ImportError(
+                f"check {preview.check_id!r} no longer has a recorded "
+                f"outcome to correct")
+        outcome = self._find_planned_outcome(check, preview.new_outcome_id)
+        run.observed_outcomes[preview.check_id] = outcome.outcome_id
+        run.check_states[preview.check_id] = "completed"
+        for reset_id in preview.reset_waiting_check_ids:
+            if reset_id in run.observed_outcomes:
+                del run.observed_outcomes[reset_id]
+            run.check_states[reset_id] = "waiting"
+        for invalidated_id in preview.invalidated_check_ids:
+            # Executed off-path nodes keep their history and sunk cost; the
+            # standard refresh leaves completed states untouched.
+            run.check_states.setdefault(invalidated_id, "completed")
+        correction_note = note or preview.note or (
+            f"corrected from {preview.previous_outcome_id!r}"
+            if preview.previous_outcome_id is not None
+            else "corrected from out_of_range")
+        self._append_run_event(
+            run, "outcome_corrected", check_id=preview.check_id,
+            outcome_id=outcome.outcome_id, note=correction_note,
+            batch_id=f"preview:{preview.preview_id}")
+        self._refresh_plan_blockers(plan, run)
+        preview.status = "confirmed"
+        for other in self._correction_previews.values():
+            if other is not preview and other.run_id == preview.run_id \
+                    and other.status == "open":
+                other.status = "superseded"
+        return run
+
+    def discard_correction_preview(self, preview_id: str) -> CorrectionPreview:
+        preview = self.correction_preview(preview_id)
+        preview.status = "discarded"
+        return preview
+
+    def _next_preview_id(self, run_id: str) -> str:
+        existing = [item for item in self._correction_previews.values()
+                    if item.run_id == run_id]
+        return f"preview-{run_id}-{len(existing) + 1}"
+
+    def _correction_trial(
+        self, plan: VerificationPlan, run: PlanRun,
+        check_id: str, outcome_id: str,
+    ) -> tuple[PlanRun, set[str], set[str]]:
+        """Build a copy of the run with the correction applied to it.
+
+        Returns the trial plus the completed descendants that must wait
+        again and the executed descendants whose old branch result no longer
+        has force.
+        """
+        trial = PlanRun.from_dict(copy.deepcopy(run.as_dict()))
+        trial.observed_outcomes[check_id] = outcome_id
+        trial.check_states[check_id] = "completed"
+        descendants = self._descendant_plan_checks(plan, check_id)
+        incoming = self._plan_incoming(plan)
+        reset_ids: set[str] = set()
+        invalidated: set[str] = set()
+        # Reset joins and invalidated linear nodes can themselves feed more
+        # executed nodes: iterate to a fixpoint so loss of force propagates.
+        changed = True
+        while changed:
+            changed = False
+            for other_id in descendants:
+                if other_id in reset_ids:
+                    continue
+                state = trial.check_states.get(other_id)
+                if state in {"pending", "available", "blocked", "waiting",
+                             "off_path", "invalid", None}:
+                    continue
+                is_join = len(incoming[other_id]) > 1
+                supporting_parents = self._correction_supporting_parents(
+                    plan, trial, other_id)
+                if supporting_parents:
+                    continue
+                if is_join:
+                    if other_id in trial.observed_outcomes:
+                        del trial.observed_outcomes[other_id]
+                    trial.check_states[other_id] = "waiting"
+                    reset_ids.add(other_id)
+                    changed = True
+                else:
+                    trial.check_states[other_id] = "invalid"
+                    trial.observed_outcomes.pop(other_id, None)
+                    invalidated.add(other_id)
+                    changed = True
+        self._refresh_plan_blockers(plan, trial)
+        return trial, reset_ids, invalidated
+
+    def _correction_supporting_parents(
+        self, plan: VerificationPlan, trial: PlanRun, check_id: str,
+    ) -> set[str]:
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        reachable = self._reachable_plan_checks(plan, trial)
+        supporting: set[str] = set()
+        for parent in incoming[check_id]:
+            if parent not in reachable:
+                continue
+            if trial.check_states.get(parent) != "completed":
+                continue
+            observed = trial.observed_outcomes.get(parent)
+            outcome = self._find_planned_outcome(by_id[parent], observed)
+            if check_id in outcome.next_check_ids:
+                supporting.add(parent)
+        return supporting
+
+    def _descendant_plan_checks(self, plan: VerificationPlan,
+                                root_id: str) -> set[str]:
+        by_id = {check.check_id: check for check in plan.checks}
+        seen: set[str] = set()
+        stack = [root_id]
+        while stack:
+            current = stack.pop()
+            for outcome in by_id[current].outcomes:
+                for next_id in outcome.next_check_ids:
+                    if next_id not in seen:
+                        seen.add(next_id)
+                        stack.append(next_id)
+        seen.discard(root_id)
+        return seen
+
+    def _conditional_preview_for_trial(
+        self, plan: VerificationPlan, run: PlanRun, trial: PlanRun,
+        reset_ids: set[str],
+    ) -> dict[str, float]:
+        by_id = {check.check_id: check for check in plan.checks}
+        paths = self._conditional_plan_paths(plan, trial)
+        effective_costs = dict(run.actual_costs)
+        for reset_id in reset_ids:
+            effective_costs[reset_id] = 0.0
+        worst = 0.0
+        for path in paths:
+            total = sum(by_id[cid].cost for cid in path["check_ids"])
+            already = sum(effective_costs.get(cid, 0.0)
+                          for cid in path["check_ids"])
+            worst = max(worst, max(0.0, total - already))
+        return {"uncommitted_cost": worst}
+
+    @staticmethod
+    def _correction_resulting_states(
+        run: PlanRun, trial: PlanRun, invalidated: frozenset[str],
+    ) -> dict[str, str]:
+        states = dict(trial.check_states)
+        for check_id in invalidated:
+            states[check_id] = run.check_states.get(check_id, "completed")
+        return states
+
+    @staticmethod
+    def _correction_resulting_outcomes(
+        run: PlanRun, trial: PlanRun, invalidated: frozenset[str],
+    ) -> dict[str, str]:
+        outcomes = dict(trial.observed_outcomes)
+        for check_id in invalidated:
+            previous = run.observed_outcomes.get(check_id)
+            if previous is not None:
+                outcomes[check_id] = previous
+        return outcomes
+
+    def _correction_fingerprint(self, plan: VerificationPlan,
+                                run: PlanRun) -> str:
+        """Hash everything that could change a correction's impact."""
+        payload = {
+            "plan": plan.as_dict(),
+            "run": run.as_dict(),
+            "materials": sorted(run.available_materials),
+            "evidence_decisions": [
+                decision.as_dict()
+                for decision in self._evidence_decisions],
+            "received_batches": [
+                batch.as_dict()
+                for batch in self._received_batches.values()],
+        }
+        encoded = json.dumps(payload, sort_keys=True, default=str,
+                             ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     def off_path_plan_checks(self, run_id: str) -> tuple[dict[str, Any], ...]:
         """Executed checks no longer on the selected path, with sunk cost."""
         run = self.plan_run(run_id)
@@ -2237,7 +2534,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 5,
+            "version": 6,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -2292,6 +2589,9 @@ class InvestigationStore:
                 decision.as_dict() for decision in self._evidence_decisions
             ],
             "plan_runs": [run.as_dict() for run in self.plan_runs()],
+            "correction_previews": [
+                preview.as_dict()
+                for preview in self._correction_previews.values()],
             "manual_judgments": [
                 {"link_id": judgment.link_id, "action": judgment.action,
                  "recorded_at": judgment.recorded_at, "note": judgment.note,
@@ -2325,7 +2625,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3, 4, 5):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -2427,4 +2727,7 @@ class InvestigationStore:
         for item in data.get("plan_runs", ()):
             run = PlanRun.from_dict(item)
             store._plan_runs[run.run_id] = run
+        for item in data.get("correction_previews", ()):
+            preview = CorrectionPreview.from_dict(item)
+            store._correction_previews[preview.preview_id] = preview
         return store

@@ -160,7 +160,7 @@ def test_file_and_network_chain_with_evidence_per_edge(tmp_path):
     assert len(reloaded.edges()) == 3
     assert reloaded.trace("guid:parent").downstream[0].claims
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["version"] == 5
+    assert raw["version"] == 6
 
 
 def test_unknown_trace_seed_raises():

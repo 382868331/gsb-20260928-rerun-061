@@ -1,6 +1,7 @@
 from .casebook import Casebook, FindingComparison, PathDiff
 from .models import (
     MANUAL_SOURCE,
+    CorrectionPreview,
     Event,
     EventKind,
     Edge,
@@ -54,6 +55,7 @@ __all__ = [
     "PlannedOutcome",
     "PlanRun",
     "PlanRunEvent",
+    "CorrectionPreview",
     "VerificationPlan",
     "ReceivedBatch",
     "EvidenceDecision",
