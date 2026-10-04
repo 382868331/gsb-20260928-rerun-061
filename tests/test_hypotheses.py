@@ -636,3 +636,113 @@ def test_terminated_plan_keeps_costs_but_allows_replacing_unexecuted_plan():
     ])
     assert [check.check_id for check in replacement.checks] == ["replacement"]
     assert store.plan_run("run-1").events[-1].action == "terminated"
+
+
+def _branching_plan(store, **kwargs):
+    return store.create_verification_plan("branches", [
+        {"check_id": "root", "label": "root", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [
+             {"outcome_id": "go-left", "next_check_ids": ["left"]},
+             {"outcome_id": "go-right", "next_check_ids": ["right"]},
+         ]},
+        {"check_id": "left", "label": "left", "source_id": "team",
+         "relation": "parent", "cost": 3,
+         "outcomes": [{"outcome_id": "left-done",
+                       "next_check_ids": ["join"]}]},
+        {"check_id": "right", "label": "right", "source_id": "team",
+         "relation": "parent", "cost": 5,
+         "outcomes": [{"outcome_id": "right-done",
+                       "next_check_ids": ["join"]}]},
+        {"check_id": "join", "label": "join", "source_id": "team",
+         "relation": "parent", "cost": 1,
+         "outcomes": [{"outcome_id": "join-done"}]},
+    ], **kwargs)
+
+
+def test_exclusive_branch_selection_controls_eligibility():
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = store.start_plan_run("branches", "run-1")
+    assert run.check_states["root"] == "available"
+    assert run.check_states["left"] == "waiting"
+    assert run.check_states["right"] == "waiting"
+
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left")
+    assert run.check_states["left"] == "available"
+    assert run.check_states["right"] == "off_path"
+    assert run.check_states["join"] == "waiting"
+    with pytest.raises(ValueError):
+        store.start_plan_check("run-1", "right")
+
+    # Join only needs the applicable (selected) predecessors.
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "left-done")
+    assert run.check_states["join"] == "available"
+
+
+def test_choice_correction_out_of_range_and_snapshot_roundtrip(tmp_path):
+    store = InvestigationStore()
+    _branching_plan(store, budget=20)
+    run = store.start_plan_run("branches", "run-1")
+    store.start_plan_check("run-1", "root")
+    store.record_plan_check_result("run-1", "root", "go-left")
+
+    # Out-of-range result on the left branch: cost is spent, dependents block.
+    store.start_plan_check("run-1", "left")
+    store.record_plan_check_result("run-1", "left", "weird")
+    assert run.check_states["left"] == "out_of_range"
+    assert run.check_states["join"] == "blocked"
+    assert run.spent_cost == 5
+
+    # Correcting the out-of-range result to a planned outcome unblocks join.
+    store.correct_plan_check_outcome("run-1", "left", "left-done",
+                                     note="lab re-read the image")
+    assert run.check_states["left"] == "completed"
+    assert run.check_states["join"] == "available"
+
+    # Researcher revises the root choice: left branch leaves the path, but
+    # its spent cost stays on the books.
+    store.correct_plan_check_outcome("run-1", "root", "go-right")
+    assert run.check_states["right"] == "available"
+    assert run.check_states["left"] == "completed"  # history is not erased
+    assert run.check_states["join"] == "waiting"
+    assert run.spent_cost == 5
+    with pytest.raises(ValueError):
+        store.start_plan_check("run-1", "left")
+
+    off_path = store.off_path_plan_checks("run-1")
+    assert [entry["check_id"] for entry in off_path] == ["left"]
+    assert off_path[0]["sunk_cost"] == 3
+    assert "root" in off_path[0]["reason"]
+    assert "go-right" in off_path[0]["reason"]
+
+    preview = store.preview_conditional_plan("branches", "run-1")
+    assert preview.available_now == ("right",)
+    assert preview.spent_cost == 5
+    assert [entry["check_id"] for entry in preview.off_path_checks] == ["left"]
+    # Remaining path is right + join; the sunk left cost is not double-counted
+    # nor dropped from the budget view.
+    assert preview.uncommitted_cost == 6
+    assert preview.budget_remaining_in_worst_case == 9
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "run.json"))
+    restored = reloaded.plan_run("run-1")
+    assert restored.check_states == run.check_states
+    assert restored.observed_outcomes == {"root": "go-right",
+                                          "left": "left-done"}
+    assert restored.spent_cost == 5
+    assert [entry["check_id"]
+            for entry in reloaded.off_path_plan_checks("run-1")] == ["left"]
+    repreview = reloaded.preview_conditional_plan("branches", "run-1")
+    assert repreview.available_now == ("right",)
+    assert repreview.budget_remaining_in_worst_case == 9
+
+    # The corrected run can still finish on the new path.
+    reloaded.start_plan_check("run-1", "right")
+    reloaded.record_plan_check_result("run-1", "right", "right-done")
+    assert reloaded.plan_run("run-1").check_states["join"] == "available"
+    assert reloaded.plan_run("run-1").spent_cost == 10
+    assert reloaded.off_path_plan_checks("run-1")[0]["sunk_cost"] == 3

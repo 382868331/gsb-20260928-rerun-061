@@ -63,6 +63,13 @@
 - **执行可暂停恢复**：`start_plan_run(...)`、`start_plan_check(...)`、
   `record_plan_check_result(...)` 保留已发生成本和事件；越界结果进入
   `out_of_range`，材料撤回或证据撤回会阻断依赖项，不会跳到“最接近”的分支。
+- **资格由实际选择决定**：后续核查只有在“适用分支上的必要前置都满足”时
+  才 `available`；根步骤选定某分支后，互斥的另一支进入 `off_path`，不会被
+  启动。`correct_plan_check_outcome(...)` 可修正早先选择（含把 `out_of_range`
+  更正为计划内结果）：未执行的步骤重新判断资格，已执行但不再属于新路径的
+  步骤保留历史状态与成本，`off_path_plan_checks(...)` 明确列出原因与沉没
+  成本；预算预览的 `spent_cost` / `budget_remaining_in_worst_case` 始终包含
+  已实际花费的旁支，互斥分支不会相加。
 
 ## 记录格式
 
@@ -176,6 +183,8 @@ preview.uncommitted_cost         # 最坏情况下仍需承诺的费用
 run = store.start_plan_run("round-2", "run-1")
 store.start_plan_check("run-1", "common")
 store.record_plan_check_result("run-1", "common", "supports-a")
+store.correct_plan_check_outcome("run-1", "common", "supports-b")  # 修正选择
+store.off_path_plan_checks("run-1")  # 已执行但不在新路径上的步骤及沉没成本
 store.pause_plan_run("run-1")
 store.resume_plan_run("run-1")
 store.compare_plan_runs("run-1")

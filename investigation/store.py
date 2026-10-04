@@ -136,6 +136,8 @@ class ConditionalPlanPreview:
     uncommitted_cost: float
     budget_remaining_in_worst_case: float | None
     repeated_source_checks: tuple[tuple[str, tuple[str, ...]], ...]
+    spent_cost: float = 0.0
+    off_path_checks: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +154,8 @@ class ConditionalPlanPreview:
             "repeated_source_checks": [
                 {"source_id": sid, "check_ids": list(check_ids)}
                 for sid, check_ids in self.repeated_source_checks],
+            "spent_cost": self.spent_cost,
+            "off_path_checks": list(self.off_path_checks),
         }
 
 
@@ -1092,6 +1096,9 @@ class InvestigationStore:
             uncommitted_cost=worst_cost,
             budget_remaining_in_worst_case=budget_left,
             repeated_source_checks=repeated_tuple,
+            spent_cost=spent,
+            off_path_checks=self.off_path_plan_checks(run.run_id)
+            if run is not None else (),
         )
 
     def compare_verification_plans(self, *plan_ids: str) -> dict[str, Any]:
@@ -1423,18 +1430,38 @@ class InvestigationStore:
             return
         by_id = {check.check_id: check for check in plan.checks}
         incoming = self._plan_incoming(plan)
+        reachable = self._reachable_plan_checks(plan, run)
         for check_id in sorted(by_id, key=lambda item: item):
             state = run.check_states.get(check_id)
-            if state not in {"pending", "available", "blocked", "waiting"}:
+            if state not in {"pending", "available", "blocked", "waiting",
+                             "off_path"}:
                 continue
             missing_materials = set(by_id[check_id].required_materials) \
                 - set(run.available_materials)
-            predecessor_states = {run.check_states.get(parent)
-                                  for parent in incoming[check_id]}
-            invalid_basis = predecessor_states & {
-                "invalid", "out_of_range", "uncommitted", "blocked"}
-            waiting_basis = predecessor_states - {
-                "completed", "invalid", "out_of_range", "uncommitted", "blocked"}
+            parents = incoming[check_id]
+            if parents and check_id not in reachable:
+                # Every resolved predecessor points elsewhere; this check is
+                # not on any currently selected branch.
+                run.check_states[check_id] = "off_path"
+                continue
+            supporting = 0
+            invalid_basis = False
+            waiting_basis = False
+            for parent in parents:
+                if parent not in reachable:
+                    # Deselected branches neither unlock nor block this check.
+                    continue
+                parent_state = run.check_states.get(parent)
+                if parent_state == "completed":
+                    observed = run.observed_outcomes.get(parent)
+                    outcome = self._find_planned_outcome(by_id[parent], observed)
+                    if check_id in outcome.next_check_ids:
+                        supporting += 1
+                elif parent_state in {"invalid", "out_of_range", "uncommitted",
+                                      "blocked"}:
+                    invalid_basis = True
+                else:
+                    waiting_basis = True
             if invalid_basis:
                 run.check_states[check_id] = "blocked"
             elif waiting_basis:
@@ -1443,6 +1470,106 @@ class InvestigationStore:
                 run.check_states[check_id] = "blocked"
             elif run.status == "active":
                 run.check_states[check_id] = "available"
+
+    def _reachable_plan_checks(self, plan: VerificationPlan,
+                               run: PlanRun) -> set[str]:
+        """Checks reachable under the run's currently observed outcomes.
+
+        A check with a recorded outcome only propagates along that outcome's
+        next_check_ids; unresolved checks keep every branch possible.
+        """
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        reachable = {check_id for check_id, parents in incoming.items()
+                     if not parents}
+        queue = list(reachable)
+        while queue:
+            current = queue.pop()
+            check = by_id[current]
+            observed = run.observed_outcomes.get(current)
+            outcomes = [self._find_planned_outcome(check, observed)] \
+                if observed is not None else list(check.outcomes)
+            for outcome in outcomes:
+                for next_id in outcome.next_check_ids:
+                    if next_id not in reachable:
+                        reachable.add(next_id)
+                        queue.append(next_id)
+        return reachable
+
+    def correct_plan_check_outcome(
+        self, run_id: str, check_id: str, outcome_id: str, *,
+        note: str = "",
+    ) -> PlanRun:
+        """Revise an earlier outcome choice without erasing spent cost."""
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        check = self._find_planned_check(plan, check_id)
+        self._require_active_run(run)
+        if run.check_states.get(check_id) not in {"completed", "out_of_range"}:
+            raise ImportError(
+                f"check {check_id!r} has no recorded outcome to correct")
+        outcome = self._find_planned_outcome(check, outcome_id)
+        previous = run.observed_outcomes.get(check_id)
+        if previous == outcome.outcome_id \
+                and run.check_states[check_id] == "completed":
+            return run
+        run.observed_outcomes[check_id] = outcome.outcome_id
+        run.check_states[check_id] = "completed"
+        correction = note or (
+            f"corrected from {previous!r}" if previous is not None
+            else "corrected from out_of_range")
+        self._append_run_event(run, "outcome_corrected", check_id=check_id,
+                               outcome_id=outcome.outcome_id, note=correction)
+        self._refresh_plan_blockers(plan, run)
+        return run
+
+    def off_path_plan_checks(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        """Executed checks no longer on the selected path, with sunk cost."""
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        by_id = {check.check_id: check for check in plan.checks}
+        incoming = self._plan_incoming(plan)
+        reachable = self._reachable_plan_checks(plan, run)
+        reports = []
+        for check_id in sorted(by_id):
+            if check_id in reachable:
+                continue
+            state = run.check_states.get(check_id)
+            executed = check_id in run.actual_costs or state in {
+                "completed", "out_of_range", "in_progress"}
+            if not executed:
+                continue
+            reports.append({
+                "check_id": check_id,
+                "state": state,
+                "sunk_cost": run.actual_costs.get(check_id, 0.0),
+                "reason": self._off_path_reason(
+                    plan, run, incoming, reachable, check_id),
+            })
+        return tuple(reports)
+
+    def _off_path_reason(self, plan: VerificationPlan, run: PlanRun,
+                         incoming: dict[str, set[str]],
+                         reachable: set[str], check_id: str) -> str:
+        by_id = {check.check_id: check for check in plan.checks}
+        deselected = []
+        unreachable_parent = None
+        for parent in sorted(incoming[check_id]):
+            observed = run.observed_outcomes.get(parent)
+            if observed is not None:
+                outcome = self._find_planned_outcome(by_id[parent], observed)
+                if check_id not in outcome.next_check_ids:
+                    deselected.append((parent, observed))
+            elif parent not in reachable and unreachable_parent is None:
+                unreachable_parent = parent
+        if deselected:
+            parent, observed = deselected[0]
+            return (f"predecessor {parent!r} resolved to outcome "
+                    f"{observed!r}, which does not lead to this check")
+        if unreachable_parent is not None:
+            return (f"predecessor {unreachable_parent!r} is itself off the "
+                    f"selected path")
+        return "no selected branch leads to this check"
 
     def _append_run_event(
         self, run: PlanRun, action: str, *,
