@@ -75,7 +75,27 @@
   批次和可能增加的预算，当前执行状态完全不变。`confirm_plan_correction(...)`
   应用与预览完全相同的变更；若预览之后证据或预算发生变化，预览被标记
   `stale`，必须重新预览才能确认。同一执行可同时保存多个相互冲突的预览，
-  确认其一后其余自动失效；预览随快照保存、重载后仍可确认。
+
+## 第三轮：多项更正的联合采用研究
+
+- **联合研究**：`create_joint_study(run_id, [(check_id, outcome_id), ...])`
+  把不同影响预览中兼容的更正组成候选方案。系统沿计划依赖图分别试算每项
+  更正与整体组合，列出需要重新核对的下游节点（`affected_check_ids`），并
+  区分共享影响（`shared_impact_check_ids`，菱形汇合处被多项更正共同触达）
+  与各更正的独立影响（`independent_impacts`）；预算中汇合节点只计一次。
+- **冲突显式化**：两项更正争用同一原证据（同一 check 的不同结果）或彼此
+  否定（一方的记录 retracts 另一方断言的记录）时，研究标记 `conflicted`
+  并给出完整 `conflict_chains`，不会按应用顺序暗中决定胜者。
+- **预算双策略**：`compare_joint_strategies(study_id, budget=...)` 在同一
+  预算上限下比较两种选择——`preserve_max` 在预算内尽量重算受影响节点以
+  保留最多既有结论，`min_recompute` 只重算被推翻的已完成结论；预算装不
+  下的节点列入 `pending_check_ids`，保持待核对而不是被静默丢弃。
+- **提交前核对证据版本**：`confirm_joint_study(...)` 重新计算证据/预算
+  指纹，期间发生改变时旧研究保留为 `stale` 并要求重新研究；确认已 applied
+  的研究是幂等空操作，重复提交不会重复扣费。
+- **重开可解释**：研究随快照保存；`explain_joint_study(study_id)` 在重开
+  后逐节点说明每项更正是已采用、未采用还是已过期，以及每个受影响节点的
+  当前状态与共享/独立归属。
 
 ## 记录格式
 
@@ -201,6 +221,16 @@ store.pause_plan_run("run-1")
 store.resume_plan_run("run-1")
 store.compare_plan_runs("run-1")
 
+# 多项更正的联合采用研究
+study = store.create_joint_study(
+    "run-1", [("check-a", "supports-b"), ("check-b", "supports-c")])
+study.shared_impact_check_ids     # 菱形汇合处，只计一次
+study.conflict_chains             # 争用同一原证据 / 彼此否定的冲突链
+comparison = store.compare_joint_strategies(study.study_id, budget=12)
+comparison["options"]             # preserve_max 与 min_recompute 两种选择
+store.confirm_joint_study(study.study_id, strategy="preserve_max")
+store.explain_joint_study(study.study_id)  # 逐节点：已采用/未采用/过期
+
 batch_id = store.receive_evidence(
     "memory-team", incoming_records,
     plan_id="round-1", check_id="check-parent", outcome_id="supports-a")
@@ -224,6 +254,8 @@ store.evidence_decisions()
   快照等首轮场景测试
 - `tests/test_hypotheses.py`：冲突父关系/重复 PID/迟到父事件、来源更正、
   人工关联撤销、增量路径失效、归档重开与对比
+- `tests/test_joint_studies.py`：多项更正联合研究、共享/独立影响、冲突链、
+  预算双策略、证据版本过期、快照重开解释与幂等确认
 
 ## 运行测试
 

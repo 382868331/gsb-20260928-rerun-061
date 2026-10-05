@@ -230,6 +230,87 @@ class CorrectionPreview:
         )
 
 
+@dataclass
+class JointStudy:
+    """Joint adoption study for composing multiple outcome corrections.
+
+    Built from compatible single-correction impact previews, the study
+    walks the plan dependency graph to find every downstream node that
+    would need re-checking, splits the impact into shared nodes (diamond
+    joins reached from more than one correction, counted once for budget)
+    and independent nodes, and records explicit conflict chains when two
+    corrections contest the same original evidence or negate each other.
+    The state fingerprint pins the evidence/budget inputs; confirming
+    re-checks it so a study made against outdated evidence stays on file
+    as stale instead of silently winning by application order.
+    """
+
+    study_id: str
+    run_id: str
+    plan_id: str
+    corrections: tuple[tuple[str, str], ...]
+    conflict_chains: tuple[dict[str, Any], ...]
+    affected_check_ids: tuple[str, ...]
+    shared_impact_check_ids: tuple[str, ...]
+    independent_impacts: tuple[tuple[str, tuple[str, ...]], ...]
+    state_fingerprint: str
+    created_at: float | None
+    status: str = "pending"  # pending | conflicted | applied | stale
+    applied_corrections: tuple[tuple[str, str], ...] = ()
+    strategy: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "study_id": self.study_id,
+            "run_id": self.run_id,
+            "plan_id": self.plan_id,
+            "corrections": [
+                {"check_id": check_id, "outcome_id": outcome_id}
+                for check_id, outcome_id in self.corrections],
+            "conflict_chains": [dict(chain) for chain in self.conflict_chains],
+            "affected_check_ids": list(self.affected_check_ids),
+            "shared_impact_check_ids": list(self.shared_impact_check_ids),
+            "independent_impacts": [
+                {"check_id": check_id, "affected_check_ids": list(affected)}
+                for check_id, affected in self.independent_impacts],
+            "state_fingerprint": self.state_fingerprint,
+            "created_at": self.created_at,
+            "status": self.status,
+            "applied_corrections": [
+                {"check_id": check_id, "outcome_id": outcome_id}
+                for check_id, outcome_id in self.applied_corrections],
+            "strategy": self.strategy,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "JointStudy":
+        return cls(
+            study_id=str(data["study_id"]),
+            run_id=str(data["run_id"]),
+            plan_id=str(data["plan_id"]),
+            corrections=tuple(
+                (str(item["check_id"]), str(item["outcome_id"]))
+                for item in data.get("corrections", ())),
+            conflict_chains=tuple(
+                dict(chain) for chain in data.get("conflict_chains", ())),
+            affected_check_ids=tuple(
+                str(item) for item in data.get("affected_check_ids", ())),
+            shared_impact_check_ids=tuple(
+                str(item) for item in data.get("shared_impact_check_ids", ())),
+            independent_impacts=tuple(
+                (str(item["check_id"]),
+                 tuple(str(node) for node in item.get("affected_check_ids", ())))
+                for item in data.get("independent_impacts", ())),
+            state_fingerprint=str(data.get("state_fingerprint", "")),
+            created_at=data.get("created_at"),
+            status=str(data.get("status", "pending")),
+            applied_corrections=tuple(
+                (str(item["check_id"]), str(item["outcome_id"]))
+                for item in data.get("applied_corrections", ())),
+            strategy=data.get("strategy"),
+        )
+
+
 class InvestigationStore:
     """In-memory evidence graph, rebuilt deterministically from raw records.
 
@@ -268,6 +349,8 @@ class InvestigationStore:
         self._evidence_decisions: list[EvidenceDecision] = []
         # Pending/applied correction impact previews (never mutate runs).
         self._correction_previews: dict[str, CorrectionPreview] = {}
+        # Joint multi-correction adoption studies (never mutate runs).
+        self._joint_studies: dict[str, JointStudy] = {}
 
     # ---------------------------------------------------------------- import
 
@@ -1708,6 +1791,378 @@ class InvestigationStore:
                         if preview.run_id == str(run_id)]
         return previews
 
+    # ------------------------------------------------------ joint studies
+
+    def create_joint_study(
+        self, run_id: str,
+        corrections: Iterable[tuple[str, str] | dict[str, str]],
+        *,
+        study_id: str | None = None,
+    ) -> JointStudy:
+        """Compose compatible corrections into one candidate adoption plan.
+
+        Each correction is a (check_id, outcome_id) pair previously
+        explorable via preview_plan_correction.  The study simulates
+        every correction alone and all corrections together on private
+        copies of the run, so downstream re-check nodes are deduplicated:
+        a diamond join reached from two corrections appears once in
+        affected_check_ids and is listed under shared_impact_check_ids
+        instead of being charged twice.  Conflicting corrections never
+        produce an order-dependent winner; they are reported as explicit
+        conflict_chains and the study is marked conflicted.
+        """
+        run = self.plan_run(run_id)
+        plan = self.verification_plan(run.plan_id)
+        self._require_active_run(run)
+        normalized: list[tuple[str, str]] = []
+        for item in corrections:
+            if isinstance(item, dict):
+                pair = (str(item["check_id"]), str(item["outcome_id"]))
+            else:
+                pair = (str(item[0]), str(item[1]))
+            check = self._find_planned_check(plan, pair[0])
+            self._find_planned_outcome(check, pair[1])
+            if run.check_states.get(pair[0]) not in {"completed", "out_of_range"}:
+                raise ImportError(
+                    f"check {pair[0]!r} has no recorded outcome to correct")
+            if pair not in normalized:
+                normalized.append(pair)
+        if not normalized:
+            raise ImportError("a joint study needs at least one correction")
+        conflicts = self._joint_conflicts(plan, normalized)
+        per_correction: dict[str, set[str]] = {}
+        for check_id, outcome_id in normalized:
+            per_correction[check_id] = self._joint_impact(
+                plan, run, [(check_id, outcome_id)])
+        combined = self._joint_impact(plan, run, normalized)
+        descendants = self._joint_descendants(
+            plan, [check_id for check_id, _ in normalized])
+        shared = tuple(sorted(
+            node for node in combined
+            if sum(node in descendants[check_id]
+                   for check_id, _ in normalized) > 1))
+        independent = tuple(
+            (check_id, tuple(sorted(
+                node for node in per_correction[check_id]
+                if node not in shared)))
+            for check_id, _ in normalized)
+        study_id = str(study_id or
+                       f"study-{run.run_id}-{len(self._joint_studies) + 1}")
+        if study_id in self._joint_studies:
+            raise ImportError(f"joint study {study_id!r} already exists")
+        study = JointStudy(
+            study_id=study_id,
+            run_id=run.run_id,
+            plan_id=plan.plan_id,
+            corrections=tuple(normalized),
+            conflict_chains=conflicts,
+            affected_check_ids=tuple(sorted(combined)),
+            shared_impact_check_ids=shared,
+            independent_impacts=independent,
+            state_fingerprint=self._correction_fingerprint(plan, run),
+            created_at=time.time(),
+            status="conflicted" if conflicts else "pending",
+        )
+        self._joint_studies[study.study_id] = study
+        return study
+
+    def joint_studies(self, run_id: str | None = None) -> list[JointStudy]:
+        studies = [self._joint_studies[key]
+                   for key in sorted(self._joint_studies)]
+        if run_id is not None:
+            studies = [study for study in studies
+                       if study.run_id == str(run_id)]
+        return studies
+
+    def joint_study(self, study_id: str) -> JointStudy:
+        return self._joint_studies[str(study_id)]
+
+    def _joint_conflicts(
+        self, plan: VerificationPlan,
+        corrections: list[tuple[str, str]],
+    ) -> tuple[dict[str, Any], ...]:
+        """Explicit conflict chains between corrections.
+
+        Two corrections conflict when they contest the same original
+        evidence (different outcomes for the same check) or when one
+        outcome's records retract a record asserted by the other
+        outcome.  The full chain is reported; no winner is picked by
+        application order.
+        """
+        by_id = {check.check_id: check for check in plan.checks}
+        conflicts: list[dict[str, Any]] = []
+        by_check: dict[str, list[str]] = defaultdict(list)
+        for check_id, outcome_id in corrections:
+            by_check[check_id].append(outcome_id)
+        for check_id in sorted(by_check):
+            outcome_ids = by_check[check_id]
+            if len(outcome_ids) > 1:
+                conflicts.append({
+                    "kind": "same_original_evidence",
+                    "check_id": check_id,
+                    "outcome_ids": sorted(outcome_ids),
+                    "chain": [
+                        f"correction {check_id}->{outcome_id} contests the "
+                        f"original evidence of check {check_id!r}"
+                        for outcome_id in sorted(outcome_ids)],
+                })
+        # A record asserted by correction (check, outcome) is identified
+        # by (check.source_id, record_id); another correction retracting
+        # that exact record negates it.
+        asserted: dict[tuple[str, str], tuple[str, str]] = {}
+        for check_id, outcome_id in corrections:
+            check = by_id[check_id]
+            outcome = self._find_planned_outcome(check, outcome_id)
+            for record in outcome.records:
+                record_id = str(record.get("record_id", ""))
+                if record_id:
+                    asserted[(check.source_id, record_id)] = (check_id, outcome_id)
+        for check_id, outcome_id in corrections:
+            check = by_id[check_id]
+            outcome = self._find_planned_outcome(check, outcome_id)
+            for record in outcome.records:
+                for retract in record.get("retracts", ()) or ():
+                    target = (str(retract.get("source_id", check.source_id)),
+                              str(retract.get("record_id",
+                                              retract.get("target", ""))))
+                    other = asserted.get(target)
+                    if other is None or other[0] == check_id:
+                        continue
+                    conflicts.append({
+                        "kind": "mutual_negation",
+                        "check_ids": sorted({check_id, other[0]}),
+                        "chain": [
+                            f"correction {check_id}->{outcome_id} retracts "
+                            f"record {target[0]}:{target[1]}",
+                            f"record {target[0]}:{target[1]} is asserted by "
+                            f"correction {other[0]}->{other[1]}",
+                        ],
+                    })
+        return tuple(conflicts)
+
+    def _joint_impact(
+        self, plan: VerificationPlan, run: PlanRun,
+        corrections: list[tuple[str, str]],
+    ) -> set[str]:
+        """Downstream nodes needing re-check under the corrections.
+
+        A node is impacted when its run state changes or when a completed
+        conclusion falls off (or newly joins) the reachable path.
+        """
+        corrected = {check_id for check_id, _ in corrections}
+        reachable_before = self._reachable_plan_checks(plan, run)
+        simulated = copy.deepcopy(run)
+        for check_id, outcome_id in corrections:
+            simulated.observed_outcomes[check_id] = outcome_id
+            simulated.check_states[check_id] = "completed"
+        self._refresh_plan_blockers(plan, simulated)
+        reachable_after = self._reachable_plan_checks(plan, simulated)
+        impacted = set()
+        for check_id in simulated.check_states:
+            if check_id in corrected:
+                continue
+            if simulated.check_states.get(check_id) != run.check_states.get(check_id):
+                impacted.add(check_id)
+            elif (check_id in reachable_before) != (check_id in reachable_after):
+                impacted.add(check_id)
+        return impacted
+
+    @staticmethod
+    def _joint_descendants(
+        plan: VerificationPlan, check_ids: list[str],
+    ) -> dict[str, set[str]]:
+        """Downstream nodes reachable from each corrected check."""
+        outgoing: dict[str, set[str]] = defaultdict(set)
+        for check in plan.checks:
+            for outcome in check.outcomes:
+                outgoing[check.check_id] |= set(outcome.next_check_ids)
+        descendants: dict[str, set[str]] = {}
+        for check_id in check_ids:
+            seen: set[str] = set()
+            queue = list(outgoing.get(check_id, ()))
+            while queue:
+                current = queue.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                queue.extend(outgoing.get(current, ()))
+            descendants[check_id] = seen
+        return descendants
+
+    def compare_joint_strategies(
+        self, study_id: str, *,
+        budget: float | None = None,
+    ) -> dict[str, Any]:
+        """Compare two budget-capped adoption choices for a study.
+
+        Both options adopt every (non-conflicted) correction in the
+        study; they differ in how the downstream re-check is funded.
+        preserve_max re-checks as many affected nodes as the budget
+        allows, keeping the most existing conclusions fresh;
+        min_recompute re-checks only the completed conclusions that were
+        invalidated.  Shared (diamond) impact is charged once in both.
+        Nodes whose re-check does not fit the budget stay listed under
+        pending_check_ids so they remain to-be-verified instead of being
+        silently dropped.
+        """
+        study = self.joint_study(study_id)
+        if study.status == "conflicted":
+            raise ImportError(
+                f"joint study {study.study_id!r} has unresolved conflicts")
+        run = self.plan_run(study.run_id)
+        plan = self.verification_plan(run.plan_id)
+        by_id = {check.check_id: check for check in plan.checks}
+        cap = budget if budget is not None else plan.budget
+        impacted = set(study.affected_check_ids)
+        invalidated = sorted(
+            (node for node in impacted
+             if run.check_states.get(node) == "completed"),
+            key=lambda node: (by_id[node].cost, node))
+        optional = sorted(
+            (node for node in impacted
+             if run.check_states.get(node) != "completed"),
+            key=lambda node: (by_id[node].cost, node))
+
+        def fund(ordered: list[str], limit: float | None) -> tuple[list[str],
+                                                                 list[str]]:
+            remaining = None if limit is None else limit - run.spent_cost
+            funded, pending = [], []
+            for node in ordered:
+                cost = by_id[node].cost
+                if remaining is None or cost <= remaining:
+                    funded.append(node)
+                    if remaining is not None:
+                        remaining -= cost
+                else:
+                    pending.append(node)
+            return funded, pending
+
+        def build(name: str, recheck: list[str],
+                  pending: list[str]) -> dict[str, Any]:
+            cost = sum(by_id[node].cost for node in recheck)
+            return {
+                "strategy": name,
+                "corrections": tuple(
+                    {"check_id": check_id, "outcome_id": outcome_id}
+                    for check_id, outcome_id in study.corrections),
+                "preserved_check_count": sum(
+                    1 for node in recheck
+                    if run.check_states.get(node) == "completed"),
+                "recheck_check_ids": tuple(recheck),
+                "recompute_cost": cost,
+                "pending_check_ids": tuple(pending),
+                "within_budget": cap is None
+                    or run.spent_cost + cost <= cap,
+            }
+
+        min_recheck, min_pending = fund(invalidated, cap)
+        max_recheck, max_pending = fund([*invalidated, *optional], cap)
+        return {"study_id": study.study_id, "run_id": study.run_id,
+                "budget": cap,
+                "options": (build("preserve_max", max_recheck, max_pending),
+                            build("min_recompute", min_recheck, min_pending))}
+
+    def confirm_joint_study(
+        self, study_id: str, *,
+        strategy: str = "preserve_max",
+        budget: float | None = None,
+        note: str = "",
+    ) -> PlanRun:
+        """Apply a pending joint study exactly as studied.
+
+        The original evidence version is re-checked first: if evidence or
+        budget changed since the study was created, the old study is kept
+        on file as stale and a fresh study is required.  Confirming an
+        already applied study is a no-op, so duplicate submissions never
+        charge twice.
+        """
+        study = self.joint_study(study_id)
+        if study.status == "applied":
+            return self.plan_run(study.run_id)
+        if study.status != "pending":
+            raise ImportError(
+                f"joint study {study.study_id!r} is {study.status}, not pending")
+        run = self.plan_run(study.run_id)
+        plan = self.verification_plan(run.plan_id)
+        current = self._correction_fingerprint(plan, run)
+        if current != study.state_fingerprint:
+            study.status = "stale"
+            raise ImportError(
+                "evidence or budget changed since the joint study; "
+                "the old study is kept and a fresh study is required")
+        comparison = self.compare_joint_strategies(
+            study.study_id, budget=budget)
+        chosen = next((option for option in comparison["options"]
+                       if option["strategy"] == strategy), None)
+        if chosen is None:
+            raise ImportError(f"unknown joint strategy {strategy!r}")
+        for item in chosen["corrections"]:
+            run = self.correct_plan_check_outcome(
+                study.run_id, item["check_id"], item["outcome_id"],
+                note=note or f"joint study {study.study_id} ({strategy})")
+        study.applied_corrections = tuple(
+            (item["check_id"], item["outcome_id"])
+            for item in chosen["corrections"])
+        study.strategy = strategy
+        study.status = "applied"
+        return run
+
+    def explain_joint_study(self, study_id: str) -> dict[str, Any]:
+        """Per-node account of adopted, skipped and stale study parts.
+
+        Works on studies restored from a snapshot: every correction is
+        explained as adopted (still the observed outcome), not adopted
+        (left out by the chosen strategy or conflicts), or stale (the
+        study or the underlying evidence moved on).
+        """
+        study = self.joint_study(study_id)
+        run = self.plan_run(study.run_id)
+        applied = set(study.applied_corrections)
+        entries = []
+        for check_id, outcome_id in study.corrections:
+            observed = run.observed_outcomes.get(check_id)
+            if (check_id, outcome_id) in applied and observed == outcome_id:
+                status = "adopted"
+                reason = (f"applied via strategy {study.strategy!r}; the "
+                          f"observed outcome still matches")
+            elif (check_id, outcome_id) in applied:
+                status = "stale"
+                reason = (f"applied via strategy {study.strategy!r} but the "
+                          f"observed outcome is now {observed!r}")
+            elif study.status == "stale":
+                status = "stale"
+                reason = ("evidence or budget changed before confirmation; "
+                          "a fresh study is required")
+            elif study.status == "conflicted":
+                status = "not_adopted"
+                reason = "blocked by an explicit conflict chain"
+            else:
+                status = "not_adopted"
+                reason = ("not part of the confirmed strategy"
+                          if study.status == "applied"
+                          else "study not confirmed yet")
+            entries.append({"check_id": check_id, "outcome_id": outcome_id,
+                            "status": status, "reason": reason})
+        nodes = []
+        for node in study.affected_check_ids:
+            nodes.append({
+                "check_id": node,
+                "state": run.check_states.get(node),
+                "impact": ("shared" if node in study.shared_impact_check_ids
+                           else "independent"),
+                "pending": run.check_states.get(node)
+                in {"pending", "waiting", "blocked"},
+            })
+        return {
+            "study_id": study.study_id,
+            "run_id": study.run_id,
+            "status": study.status,
+            "strategy": study.strategy,
+            "corrections": tuple(entries),
+            "conflict_chains": study.conflict_chains,
+            "affected_nodes": tuple(nodes),
+        }
+
     def _correction_fingerprint(self, plan: VerificationPlan,
                                 run: PlanRun) -> str:
         """Digest of the evidence/budget inputs a correction preview uses."""
@@ -2449,7 +2904,7 @@ class InvestigationStore:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "version": 6,
+            "version": 7,
             "sources": {
                 sid: {"description": src.description,
                       "imported_at": src.imported_at,
@@ -2507,6 +2962,9 @@ class InvestigationStore:
             "correction_previews": [
                 preview.as_dict() for preview in self.correction_previews()
             ],
+            "joint_studies": [
+                study.as_dict() for study in self.joint_studies()
+            ],
             "manual_judgments": [
                 {"link_id": judgment.link_id, "action": judgment.action,
                  "recorded_at": judgment.recorded_at, "note": judgment.note,
@@ -2540,7 +2998,7 @@ class InvestigationStore:
 
     @classmethod
     def restore(cls, data: dict[str, Any]) -> "InvestigationStore":
-        if data.get("version") not in (1, 2, 3, 4, 5, 6):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7):
             raise ValueError("unsupported snapshot version")
         store = cls()
         for source_id in sorted(data.get("records", {})):
@@ -2645,4 +3103,7 @@ class InvestigationStore:
         for item in data.get("correction_previews", ()):
             preview = CorrectionPreview.from_dict(item)
             store._correction_previews[preview.preview_id] = preview
+        for item in data.get("joint_studies", ()):
+            study = JointStudy.from_dict(item)
+            store._joint_studies[study.study_id] = study
         return store
