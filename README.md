@@ -77,6 +77,32 @@
   `stale`，必须重新预览才能确认。同一执行可同时保存多个相互冲突的预览，
   确认其一后其余自动失效；预览随快照保存、重载后仍可确认。
 
+## 第三轮：多项证据更正的联合采用研究
+
+- **联合试算**：\`start_joint_correction_study(run_id, preview_ids, ...)\`
+  从不同影响预览中选取兼容的更正组成候选方案，在私有副本上同时应用全部
+  更正，沿依赖图计算需要重新核对的下游节点，当前执行状态完全不变。
+- **共享与独立影响**：被多项更正各自波及的节点（菱形汇合处）列为共享
+  影响，仅被组合整体波及（单独更正都够不到）的节点标记为
+  \`emergent\`；汇合节点在预算中只计一次，\`recheck_counts\` 只报告次数，
+  绝不按更正次数重复计费。
+- **冲突显式化**：两项更正改写同一核查（\`same_check\`）、争用同一原证据
+  批次（\`shared_evidence\`）或使彼此的已完成依据失效
+  （\`invalidates_basis\` / \`mutual_invalidation\`）时，研究状态为
+  \`conflict\` 并给出完整冲突链，绝不靠应用顺序暗中决定胜者；冲突中的
+  研究不能提交。
+- **预算上限下的两种选择**：\`compare_joint_correction_options(...)\` 按
+  预算上限对比“保留最多既有结论”（\`keep_most\`，不采纳会破坏既有结论
+  的更正）与“最少重新计算”（\`least_recompute\`，只采纳零重算代价的更
+  正）；超出预算、无法重算的节点列入 \`uncheckable_check_ids\`，保持
+  待核对，不会被静默丢弃。
+- **提交前核对版本**：\`submit_joint_correction_study(...)\` 提交前重新核对
+  原证据/预算版本指纹；研究期间发生改变时旧研究保留并标记 \`stale\`，
+  必须重新研究。重复提交是空操作，不会重复扣费或重复记录事件。
+- **重开后逐节点解释**：\`explain_joint_correction_study(...)\` 在快照保存/
+  重载后仍可逐条说明每项更正已采用（且仍生效/已被取代）、未采用
+  （被所选方案跳过）或已过期（研究失效）的原因。
+
 ## 记录格式
 
 ```python
@@ -200,6 +226,21 @@ store.confirm_plan_correction(preview.preview_id)  # 应用与预览相同的变
 store.pause_plan_run("run-1")
 store.resume_plan_run("run-1")
 store.compare_plan_runs("run-1")
+
+# 多项更正的联合采用研究
+first = store.preview_plan_correction("run-1", "root", "go-right")
+second = store.preview_plan_correction("run-1", "left", "left-done")
+study = store.start_joint_correction_study(
+    "run-1", [first.preview_id, second.preview_id], budget_limit=20)
+study.status                      # pending | conflict
+study.shared_impacts              # 菱形汇合处的共享影响（只计一次）
+study.independent_impacts         # 各更正独立的下游影响
+study.conflicts                   # 冲突链：争用证据/彼此否定时显式列出
+for option in store.compare_joint_correction_options(study.study_id):
+    option["option_id"]           # keep_most | least_recompute
+    option["uncheckable_check_ids"]  # 预算内无法重算、保持待核对的节点
+store.submit_joint_correction_study(study.study_id)  # 重复提交不重复扣费
+store.explain_joint_correction_study(study.study_id)  # 采用/未采用/过期
 
 batch_id = store.receive_evidence(
     "memory-team", incoming_records,

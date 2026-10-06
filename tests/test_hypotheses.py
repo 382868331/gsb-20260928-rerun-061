@@ -866,3 +866,317 @@ def test_conflicting_correction_previews_and_snapshot_roundtrip(tmp_path):
         reloaded.confirm_plan_correction(fix_left.preview_id)
     assert reloaded.plan_run("run-1").observed_outcomes == {"root": "go-right"}
     assert reloaded.plan_run("run-1").check_states["left"] == "out_of_range"
+
+
+def _routes_plan(store, **kwargs):
+    return store.create_verification_plan("routes", [
+        {"check_id": "r1", "label": "r1", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [
+             {"outcome_id": "use-a", "next_check_ids": ["a"]},
+             {"outcome_id": "drop-a"},
+             {"outcome_id": "use-c", "next_check_ids": ["c"]},
+         ]},
+        {"check_id": "r2", "label": "r2", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [
+             {"outcome_id": "use-b", "next_check_ids": ["b"]},
+             {"outcome_id": "drop-b"},
+         ]},
+        {"check_id": "a", "label": "a", "source_id": "team",
+         "relation": "parent", "cost": 1,
+         "outcomes": [
+             {"outcome_id": "a-done", "next_check_ids": ["join"]},
+             {"outcome_id": "a-recheck", "next_check_ids": ["join"]},
+         ]},
+        {"check_id": "b", "label": "b", "source_id": "team",
+         "relation": "parent", "cost": 1,
+         "outcomes": [{"outcome_id": "b-done",
+                       "next_check_ids": ["join"]}]},
+        {"check_id": "join", "label": "join", "source_id": "team",
+         "relation": "parent", "cost": 2,
+         "outcomes": [{"outcome_id": "join-done",
+                       "next_check_ids": ["tail"]}]},
+        {"check_id": "tail", "label": "tail", "source_id": "team",
+         "relation": "parent", "cost": 3,
+         "outcomes": [{"outcome_id": "tail-done"}]},
+        {"check_id": "c", "label": "c", "source_id": "team",
+         "relation": "parent", "cost": 5,
+         "outcomes": [{"outcome_id": "c-done"}]},
+    ], **kwargs)
+
+
+def _routes_run(store):
+    run = store.start_plan_run("routes", "run-1")
+    store.start_plan_check("run-1", "r1")
+    store.record_plan_check_result("run-1", "r1", "use-a",
+                                   batch_id="batch-r1")
+    store.start_plan_check("run-1", "a")
+    store.record_plan_check_result("run-1", "a", "a-done",
+                                   batch_id="batch-a")
+    store.start_plan_check("run-1", "r2")
+    store.record_plan_check_result("run-1", "r2", "use-b",
+                                   batch_id="batch-r2")
+    store.start_plan_check("run-1", "b")
+    store.record_plan_check_result("run-1", "b", "b-done",
+                                   batch_id="batch-b")
+    store.start_plan_check("run-1", "join")
+    store.record_plan_check_result("run-1", "join", "join-done",
+                                   batch_id="batch-join")
+    return run
+
+
+def test_joint_study_shared_and_independent_impacts():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    run = _routes_run(store)
+    store.start_plan_check("run-1", "tail")
+    store.record_plan_check_result("run-1", "tail", "tail-done",
+                                   batch_id="batch-tail")
+    assert run.spent_cost == 11
+
+    first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    second = store.preview_plan_correction("run-1", "r2", "drop-b")
+    assert first.invalidated_check_ids == ("a",)
+    assert second.invalidated_check_ids == ("b",)
+
+    study = store.start_joint_correction_study(
+        "run-1", [first.preview_id, second.preview_id])
+    assert study.status == "pending"
+    assert study.conflicts == ()
+    # The diamond join and its tail fall only when both corrections are
+    # adopted: they are shared (emergent) impacts, not independent ones.
+    assert study.invalidated_check_ids == ("a", "b", "join", "tail")
+    assert {item["check_id"] for item in study.independent_impacts} == \
+        {"a", "b"}
+    shared = {item["check_id"]: item for item in study.shared_impacts}
+    assert set(shared) == {"join", "tail"}
+    assert shared["join"]["emergent"] is True
+    # Shared nodes are reported once; the budget never charges them twice.
+    counts = {item["check_id"]: item["recheck_count"]
+              for item in study.recheck_counts}
+    assert counts == {"join": 1, "tail": 1}
+    assert study.budget_remaining_in_worst_case == 19
+    # The run itself is untouched by the study.
+    assert run.observed_outcomes == {"r1": "use-a", "r2": "use-b",
+                                     "a": "a-done", "b": "b-done",
+                                     "join": "join-done",
+                                     "tail": "tail-done"}
+
+    options = {option["option_id"]: option
+               for option in store.compare_joint_correction_options(
+                   study.study_id)}
+    # Both corrections cost existing conclusions, so the conservative
+    # strategies decline them and nothing needs re-checking.
+    assert options["keep_most"]["adopted"] == []
+    assert options["keep_most"]["kept_completed"] == 6
+    assert options["least_recompute"]["adopted"] == []
+    assert options["least_recompute"]["recheck_cost"] == 0
+    assert options["least_recompute"]["feasible"] is True
+
+
+def test_joint_study_submit_and_idempotent_resubmit():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    run = _routes_run(store)
+    first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    second = store.preview_plan_correction("run-1", "r2", "drop-b")
+    study = store.start_joint_correction_study(
+        "run-1", [first.preview_id, second.preview_id])
+
+    confirmed = store.submit_joint_correction_study(study.study_id)
+    assert confirmed.observed_outcomes["r1"] == "drop-a"
+    assert confirmed.observed_outcomes["r2"] == "drop-b"
+    # History is preserved: join stays completed but leaves the path.
+    assert confirmed.check_states["join"] == "completed"
+    assert {entry["check_id"]
+            for entry in store.off_path_plan_checks("run-1")} == \
+        {"a", "b", "join"}
+    assert confirmed.spent_cost == 8  # sunk cost kept, nothing re-charged
+    event_count = len(confirmed.events)
+    assert store.joint_correction_study(study.study_id).status == "submitted"
+
+    # Re-submitting is a no-op: no duplicate charge, no duplicate events.
+    again = store.submit_joint_correction_study(study.study_id)
+    assert again.spent_cost == 8
+    assert len(again.events) == event_count
+
+    explanation = store.explain_joint_correction_study(study.study_id)
+    assert explanation["status"] == "submitted"
+    assert {(entry["check_id"], entry["effect"])
+            for entry in explanation["adopted"]} == \
+        {("r1", "in_effect"), ("r2", "in_effect")}
+    assert explanation["expired"] == []
+
+
+def test_joint_study_conflicting_corrections_report_chain():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    _routes_run(store)
+    to_drop = store.preview_plan_correction("run-1", "r1", "drop-a")
+    to_c = store.preview_plan_correction("run-1", "r1", "use-c")
+
+    study = store.start_joint_correction_study(
+        "run-1", [to_drop.preview_id, to_c.preview_id])
+    assert study.status == "conflict"
+    conflict = study.conflicts[0]
+    assert conflict["kind"] == "same_check"
+    chain = " ".join(conflict["chain"])
+    assert "r1" in chain and "drop-a" in chain and "use-c" in chain
+    assert "application order" in chain
+    with pytest.raises(ValueError, match="conflict"):
+        store.submit_joint_correction_study(study.study_id)
+    # The conflicted study changes nothing.
+    assert store.plan_run("run-1").observed_outcomes["r1"] == "use-a"
+
+
+def test_joint_study_shared_evidence_conflict():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    run = store.start_plan_run("routes", "run-1")
+    store.start_plan_check("run-1", "r1")
+    store.record_plan_check_result("run-1", "r1", "use-a",
+                                   batch_id="batch-shared")
+    store.start_plan_check("run-1", "a")
+    store.record_plan_check_result("run-1", "a", "a-done",
+                                   batch_id="batch-shared")
+    first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    second = store.preview_plan_correction("run-1", "a", "a-recheck")
+    # Two corrected checks whose results came from one batch contend for
+    # the same original evidence.
+    study = store.start_joint_correction_study(
+        "run-1", [first.preview_id, second.preview_id])
+    kinds = {conflict["kind"] for conflict in study.conflicts}
+    assert "shared_evidence" in kinds
+    shared = [conflict for conflict in study.conflicts
+              if conflict["kind"] == "shared_evidence"][0]
+    chain = " ".join(shared["chain"])
+    assert "batch-shared" in chain
+    assert "r1" in chain and "a" in chain
+    assert study.status == "conflict"
+    with pytest.raises(ValueError, match="conflict"):
+        store.submit_joint_correction_study(study.study_id)
+
+
+def test_joint_study_stale_after_evidence_change_and_restudy():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    _routes_run(store)
+    first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    second = store.preview_plan_correction("run-1", "r2", "drop-b")
+    study = store.start_joint_correction_study(
+        "run-1", [first.preview_id, second.preview_id])
+
+    # The original evidence version changes before submission.
+    store.receive_evidence("team", [{"record_id": "late-1",
+                                     "kind": "process", "ts": 1.0}])
+    with pytest.raises(ValueError, match="fresh joint study"):
+        store.submit_joint_correction_study(study.study_id)
+    # The old preview is kept and explained as expired, not deleted.
+    assert store.joint_correction_study(study.study_id).status == "stale"
+    explanation = store.explain_joint_correction_study(study.study_id)
+    assert {entry["check_id"] for entry in explanation["expired"]} == \
+        {"r1", "r2"}
+
+    fresh_first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    fresh_second = store.preview_plan_correction("run-1", "r2", "drop-b")
+    restudied = store.start_joint_correction_study(
+        "run-1", [fresh_first.preview_id, fresh_second.preview_id])
+    store.submit_joint_correction_study(restudied.study_id)
+    assert store.plan_run("run-1").observed_outcomes["r1"] == "drop-a"
+
+
+def test_joint_study_budget_cap_marks_uncheckable_nodes():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    run = store.start_plan_run("routes", "run-1")
+    store.start_plan_check("run-1", "r1")
+    store.record_plan_check_result("run-1", "r1", "drop-a",
+                                   batch_id="batch-r1")
+    store.start_plan_check("run-1", "r2")
+    store.record_plan_check_result("run-1", "r2", "use-b",
+                                   batch_id="batch-r2")
+    store.start_plan_check("run-1", "b")
+    store.record_plan_check_result("run-1", "b", "b-done",
+                                   batch_id="batch-b")
+    store.start_plan_check("run-1", "join")
+    store.record_plan_check_result("run-1", "join", "join-done",
+                                   batch_id="batch-join")
+    assert run.spent_cost == 7
+    to_c = store.preview_plan_correction("run-1", "r1", "use-c")
+    study = store.start_joint_correction_study(
+        "run-1", [to_c.preview_id], budget_limit=10)
+    # spent 7 + c (5) exceeds the cap of 10; c stays pending (待核对).
+    assert study.budget_remaining_in_worst_case == -2
+    assert study.potential_budget_increase == 2
+    option = study.options[0]
+    assert option["feasible"] is False
+    assert option["uncheckable_check_ids"] == ("c",)
+
+    # Submission is still possible; unaffordable nodes simply stay pending.
+    store.submit_joint_correction_study(study.study_id)
+    run = store.plan_run("run-1")
+    assert run.observed_outcomes["r1"] == "use-c"
+    assert run.check_states["c"] == "available"
+    assert run.spent_cost == 7
+
+
+def test_joint_study_submit_with_option_explains_skipped():
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    _routes_run(store)
+    destructive = store.preview_plan_correction("run-1", "r1", "drop-a")
+    harmless = store.preview_plan_correction("run-1", "join", "join-done")
+    study = store.start_joint_correction_study(
+        "run-1", [destructive.preview_id, harmless.preview_id])
+    options = {option["option_id"]: option
+               for option in study.options}
+    # keep_most declines the conclusion-destroying correction but adopts
+    # the zero-impact one.
+    assert [item["check_id"]
+            for item in options["keep_most"]["adopted"]] == ["join"]
+    assert [item["check_id"]
+            for item in options["keep_most"]["skipped"]] == ["r1"]
+
+    store.submit_joint_correction_study(study.study_id,
+                                        option_id="keep_most")
+    run = store.plan_run("run-1")
+    assert run.observed_outcomes["r1"] == "use-a"  # skipped, not applied
+    assert run.spent_cost == 8
+    explanation = store.explain_joint_correction_study(study.study_id)
+    assert [entry["check_id"]
+            for entry in explanation["adopted"]] == ["join"]
+    assert [entry["check_id"]
+            for entry in explanation["not_adopted"]] == ["r1"]
+    assert explanation["not_adopted"][0]["reason"]
+
+
+def test_joint_study_snapshot_roundtrip(tmp_path):
+    store = InvestigationStore()
+    _routes_plan(store, budget=30)
+    _routes_run(store)
+    first = store.preview_plan_correction("run-1", "r1", "drop-a")
+    second = store.preview_plan_correction("run-1", "r2", "drop-b")
+    study = store.start_joint_correction_study(
+        "run-1", [first.preview_id, second.preview_id])
+
+    from investigation.snapshot import load_snapshot, save_snapshot
+    reloaded = load_snapshot(save_snapshot(store, tmp_path / "study.json"))
+    restored = reloaded.joint_correction_study(study.study_id)
+    assert restored.status == "pending"
+    assert restored.invalidated_check_ids == ("a", "b", "join")
+    assert {item["check_id"] for item in restored.shared_impacts} == \
+        {"join"}
+
+    # A pending study survives save/reload and can still be submitted.
+    reloaded.submit_joint_correction_study(study.study_id)
+    run = reloaded.plan_run("run-1")
+    assert run.observed_outcomes["r1"] == "drop-a"
+    assert run.observed_outcomes["r2"] == "drop-b"
+    explanation = reloaded.explain_joint_correction_study(study.study_id)
+    assert len(explanation["adopted"]) == 2
+    # Reloading again keeps the submitted status and explanation stable.
+    again = load_snapshot(save_snapshot(reloaded, tmp_path / "study2.json"))
+    assert again.joint_correction_study(study.study_id).status == "submitted"
+    assert len(again.explain_joint_correction_study(
+        study.study_id)["adopted"]) == 2
